@@ -14,7 +14,7 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Rhythm Tracker // v0.1 skeleton"
+            android:text="RenderMyMind Alpha // v0.2"
             android:textColor="#FFFFFF"
             android:textSize="24sp"
             android:textStyle="bold" />
@@ -23,7 +23,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
-            android:text="Pulse-capture MediaProjection test. No OCR yet."
+            android:text="Persistent low-res MediaProjection + lightweight OCR sentinel. Native capture wakes only after a result-like hit."
             android:textColor="#B8BBC2"
             android:textSize="15sp" />
 
@@ -64,7 +64,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="16dp"
-            android:text="Prototype rule: a generic stable-screen detector may flag candidates, but it deliberately does NOT save them as rhythm-game results. A game-specific adapter must confirm a result screen first."
+            android:text="Alpha rule: the generic OCR gate is only a plumbing test. A game-specific adapter will replace its ROI and keywords before automatic score extraction is trusted. Captured result PNGs are evidence only and do not become score records yet."
             android:textColor="#8E929B"
             android:textSize="13sp" />
 
