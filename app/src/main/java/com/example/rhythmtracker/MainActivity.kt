@@ -115,7 +115,7 @@ class MainActivity : Activity() {
             putExtra(CaptureService.EXTRA_RESULT_DATA, data)
         }
         startForegroundService(serviceIntent)
-        TrackerRuntime.lastMessage = "Starting projection service…"
+        TrackerRuntime.lastMessage = "Starting RenderMyMind Alpha projection service…"
     }
 
     override fun onRequestPermissionsResult(
@@ -139,12 +139,16 @@ class MainActivity : Activity() {
         }
 
         statusText.text = buildString {
-            appendLine("tracking       : ${TrackerRuntime.active}")
-            appendLine("capture size   : ${TrackerRuntime.captureSize}")
-            appendLine("sampled frames : ${TrackerRuntime.sampledFrames}")
-            appendLine("stable screens : ${TrackerRuntime.stableCandidates}")
-            appendLine("saved results  : ${TrackerRuntime.savedResults}")
-            appendLine("last sample    : $sampleTime")
+            appendLine("tracking        : ${TrackerRuntime.active}")
+            appendLine("capture mode    : ${TrackerRuntime.captureSize}")
+            appendLine("frames pulled   : ${TrackerRuntime.sampledFrames}")
+            appendLine("OCR probes      : ${TrackerRuntime.ocrProbes}")
+            appendLine("OCR result hits : ${TrackerRuntime.ocrHits}")
+            appendLine("screens captured: ${TrackerRuntime.capturedScreens}")
+            appendLine("saved results   : ${TrackerRuntime.savedResults}")
+            appendLine("last sample     : $sampleTime")
+            appendLine("last OCR text   : ${TrackerRuntime.lastOcrText}")
+            appendLine("last PNG        : ${TrackerRuntime.lastCapturePath}")
             appendLine()
             append(TrackerRuntime.lastMessage)
         }
