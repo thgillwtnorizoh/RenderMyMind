@@ -14,7 +14,7 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="RenderMyMind Alpha // v0.2"
+            android:text="RenderMyMind Alpha // v0.2.1"
             android:textColor="#FFFFFF"
             android:textSize="24sp"
             android:textStyle="bold" />
@@ -23,7 +23,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
-            android:text="Persistent low-res MediaProjection + lightweight OCR sentinel. Native capture wakes only after a result-like hit."
+            android:text="Persistent low-res MediaProjection + lightweight OCR sentinel. Diagnostic state survives reopening and can be exported as JSONL."
             android:textColor="#B8BBC2"
             android:textSize="15sp" />
 
@@ -40,6 +40,13 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
             android:text="@string/stop_tracking" />
+
+        <Button
+            android:id="@+id/exportDiagnosticsButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/export_diagnostics" />
 
         <Button
             android:id="@+id/testRecordButton"
@@ -64,7 +71,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="16dp"
-            android:text="Alpha rule: the generic OCR gate is only a plumbing test. A game-specific adapter will replace its ROI and keywords before automatic score extraction is trusted. Captured result PNGs are evidence only and do not become score records yet."
+            android:text="Diagnostics are intentionally low-frequency: state is persisted every 15 seconds and at important events. OCR probes themselves do not write to disk."
             android:textColor="#8E929B"
             android:textSize="13sp" />
 
