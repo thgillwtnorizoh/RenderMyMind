@@ -1,0 +1,17 @@
+# Gradle / Android Studio
+.gradle/
+.idea/
+*.iml
+local.properties
+
+# Build output
+build/
+app/build/
+
+# Native build output
+.externalNativeBuild/
+.cxx/
+
+# Misc
+.DS_Store
+captures/
