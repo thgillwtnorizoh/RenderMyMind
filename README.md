@@ -26,8 +26,10 @@ A deliberately small Android skeleton for testing the hard plumbing before OCR:
 - Android Gradle Plugin: 9.3.0
 - Gradle: 9.5.0
 - JDK: 17+
-- compileSdk / targetSdk: 37
+- compileSdk / targetSdk: 36
 - minSdk: 29
+
+CI intentionally targets Android API 36. Do not bump the GitHub Actions build to API 37 unless the hosted Android SDK channel actually provides it; an earlier API 37 CI attempt failed because that platform package was unavailable.
 
 This source bundle contains `gradle/wrapper/gradle-wrapper.properties`, but not the binary
 `gradle-wrapper.jar`. The generation environment could not fetch binary wrapper files.
