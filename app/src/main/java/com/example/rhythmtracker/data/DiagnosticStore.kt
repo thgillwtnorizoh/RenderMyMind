@@ -1,7 +1,6 @@
 package com.example.rhythmtracker.data
 
 import android.content.Context
-import com.example.rhythmtracker.BuildConfig
 import com.example.rhythmtracker.TrackerRuntime
 import org.json.JSONObject
 import java.io.File
@@ -16,6 +15,10 @@ import java.io.OutputStream
 class DiagnosticStore(context: Context) {
     private val logFile = File(context.filesDir, "diagnostics.jsonl")
     private val snapshotFile = File(context.filesDir, "diagnostic_state.json")
+    private val appVersion = runCatching {
+        @Suppress("DEPRECATION")
+        context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "unknown"
+    }.getOrDefault("unknown")
 
     @Synchronized
     fun saveSnapshot(snapshot: DiagnosticSnapshot) {
@@ -63,28 +66,26 @@ class DiagnosticStore(context: Context) {
         }
     }
 
-    companion object {
-        fun snapshotFromRuntime(): DiagnosticSnapshot = DiagnosticSnapshot(
-            version = BuildConfig.VERSION_NAME,
-            sessionId = TrackerRuntime.sessionId,
-            sessionStartedAtMs = TrackerRuntime.sessionStartedAtMs,
-            snapshotAtMs = System.currentTimeMillis(),
-            active = TrackerRuntime.active,
-            captureMode = TrackerRuntime.captureSize,
-            sampledFrames = TrackerRuntime.sampledFrames,
-            ocrProbes = TrackerRuntime.ocrProbes,
-            ocrHits = TrackerRuntime.ocrHits,
-            capturedScreens = TrackerRuntime.capturedScreens,
-            savedResults = TrackerRuntime.savedResults,
-            lastSampleAtMs = TrackerRuntime.lastSampleAtMs,
-            lastOcrDurationMs = TrackerRuntime.lastOcrDurationMs,
-            maxOcrDurationMs = TrackerRuntime.maxOcrDurationMs,
-            totalOcrDurationMs = TrackerRuntime.totalOcrDurationMs,
-            lastOcrText = TrackerRuntime.lastOcrText,
-            lastCapturePath = TrackerRuntime.lastCapturePath,
-            lastMessage = TrackerRuntime.lastMessage
-        )
-    }
+    fun snapshotFromRuntime(): DiagnosticSnapshot = DiagnosticSnapshot(
+        version = appVersion,
+        sessionId = TrackerRuntime.sessionId,
+        sessionStartedAtMs = TrackerRuntime.sessionStartedAtMs,
+        snapshotAtMs = System.currentTimeMillis(),
+        active = TrackerRuntime.active,
+        captureMode = TrackerRuntime.captureSize,
+        sampledFrames = TrackerRuntime.sampledFrames,
+        ocrProbes = TrackerRuntime.ocrProbes,
+        ocrHits = TrackerRuntime.ocrHits,
+        capturedScreens = TrackerRuntime.capturedScreens,
+        savedResults = TrackerRuntime.savedResults,
+        lastSampleAtMs = TrackerRuntime.lastSampleAtMs,
+        lastOcrDurationMs = TrackerRuntime.lastOcrDurationMs,
+        maxOcrDurationMs = TrackerRuntime.maxOcrDurationMs,
+        totalOcrDurationMs = TrackerRuntime.totalOcrDurationMs,
+        lastOcrText = TrackerRuntime.lastOcrText,
+        lastCapturePath = TrackerRuntime.lastCapturePath,
+        lastMessage = TrackerRuntime.lastMessage
+    )
 }
 
 data class DiagnosticSnapshot(
