@@ -136,6 +136,12 @@ class CaptureService : Service() {
 
         val projectionManager = getSystemService(MediaProjectionManager::class.java)
         val projection = projectionManager.getMediaProjection(resultCode, resultData)
+        if (projection == null) {
+            TrackerRuntime.lastMessage = "Android returned no MediaProjection instance"
+            stopSelf()
+            return
+        }
+
         mediaProjection = projection
         projection.registerCallback(projectionCallback, captureHandler)
 
