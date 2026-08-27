@@ -20,11 +20,15 @@ import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
+import android.os.SystemClock
 import android.view.WindowManager
 import com.example.rhythmtracker.MainActivity
 import com.example.rhythmtracker.R
 import com.example.rhythmtracker.TrackerRuntime
+import com.example.rhythmtracker.data.DiagnosticStore
 import com.example.rhythmtracker.data.ResultCaptureStore
+import org.json.JSONObject
+import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
@@ -35,8 +39,10 @@ class CaptureService : Service() {
     private lateinit var captureThread: HandlerThread
     private lateinit var captureHandler: Handler
     private lateinit var captureStore: ResultCaptureStore
+    private lateinit var diagnosticStore: DiagnosticStore
 
     private val analysisExecutor = Executors.newSingleThreadExecutor()
+    private val diagnosticExecutor = Executors.newSingleThreadExecutor()
     private val ocrGate = LightResultOcrGate()
 
     private var mediaProjection: MediaProjection? = null
@@ -51,16 +57,32 @@ class CaptureService : Service() {
     private var densityDpi = 0
 
     private var probeInFlight = false
+    private var probeStartedAtNs = 0L
     private var burstInProgress = false
     private var burstFramesSeen = 0
     private var resultArmed = true
     private var consecutiveMisses = 0
+    private var ownsSession = false
+    private var lastSlowOcrLoggedAtMs = 0L
 
     private val shuttingDown = AtomicBoolean(false)
 
     private val probeRunnable = Runnable { pullProbeFrame() }
+
+    private val diagnosticRunnable = object : Runnable {
+        override fun run() {
+            if (!TrackerRuntime.active || shuttingDown.get() || !ownsSession) return
+            queueDiagnosticsSnapshot()
+            captureHandler.postDelayed(this, DIAGNOSTIC_SNAPSHOT_INTERVAL_MS)
+        }
+    }
+
     private val burstTimeoutRunnable = Runnable {
         if (!burstInProgress || shuttingDown.get()) return@Runnable
+        queueDiagnosticsSnapshot(
+            event = "native_capture_timeout",
+            extra = JSONObject().put("framesSeen", burstFramesSeen)
+        )
         restoreProbeSurface("Native result capture timed out; returned to OCR probe")
     }
 
@@ -82,6 +104,7 @@ class CaptureService : Service() {
         captureThread.start()
         captureHandler = Handler(captureThread.looper)
         captureStore = ResultCaptureStore(this)
+        diagnosticStore = DiagnosticStore(this)
         createNotificationChannel()
     }
 
@@ -101,6 +124,10 @@ class CaptureService : Service() {
             ACTION_STOP -> {
                 TrackerRuntime.lastMessage = "Stopping tracking…"
                 stopSelf()
+            }
+
+            ACTION_FLUSH_DIAGNOSTICS -> {
+                if (ownsSession) saveDiagnosticsNow("manual_flush", appendEvent = true)
             }
         }
         return START_NOT_STICKY
@@ -122,6 +149,7 @@ class CaptureService : Service() {
         shutdownProjection(requestProjectionStop = true)
         ocrGate.close()
         analysisExecutor.shutdownNow()
+        diagnosticExecutor.shutdownNow()
         if (::captureThread.isInitialized) captureThread.quitSafely()
         stopForeground(STOP_FOREGROUND_REMOVE)
         super.onDestroy()
@@ -185,15 +213,26 @@ class CaptureService : Service() {
 
         shuttingDown.set(false)
         probeInFlight = false
+        probeStartedAtNs = 0L
         burstInProgress = false
         resultArmed = true
         consecutiveMisses = 0
+        lastSlowOcrLoggedAtMs = 0L
 
+        val startedAtMs = System.currentTimeMillis()
+        TrackerRuntime.resetForNewSession(
+            id = UUID.randomUUID().toString(),
+            startedAtMs = startedAtMs
+        )
+        ownsSession = true
         TrackerRuntime.active = true
         TrackerRuntime.captureSize = "${probeWidth}x${probeHeight} persistent OCR probe"
         TrackerRuntime.lastMessage =
-            "v0.2 active; persistent low-res surface + light OCR every ${PROBE_INTERVAL_MS}ms"
+            "v0.2.1 active; persistent low-res surface + light OCR every ${PROBE_INTERVAL_MS}ms"
 
+        saveDiagnosticsNow("session_start", appendEvent = true)
+        captureHandler.removeCallbacks(diagnosticRunnable)
+        captureHandler.postDelayed(diagnosticRunnable, DIAGNOSTIC_SNAPSHOT_INTERVAL_MS)
         scheduleNextProbe(250L)
     }
 
@@ -221,6 +260,7 @@ class CaptureService : Service() {
         TrackerRuntime.ocrProbes += 1
         TrackerRuntime.lastSampleAtMs = System.currentTimeMillis()
         probeInFlight = true
+        probeStartedAtNs = SystemClock.elapsedRealtimeNanos()
 
         try {
             // inspect() immediately copies only the small OCR ROI, so the full probe bitmap can
@@ -233,8 +273,13 @@ class CaptureService : Service() {
         } catch (error: Throwable) {
             captureHandler.post {
                 probeInFlight = false
+                probeStartedAtNs = 0L
                 TrackerRuntime.lastMessage =
                     "OCR probe setup failed: ${error.message ?: error.javaClass.simpleName}"
+                queueDiagnosticsSnapshot(
+                    event = "ocr_setup_error",
+                    extra = JSONObject().put("message", TrackerRuntime.lastMessage)
+                )
                 scheduleNextProbe(PROBE_INTERVAL_MS)
             }
         } finally {
@@ -246,12 +291,39 @@ class CaptureService : Service() {
         if (shuttingDown.get()) return
         probeInFlight = false
 
+        val startedAtNs = probeStartedAtNs
+        probeStartedAtNs = 0L
+        if (startedAtNs != 0L) {
+            val durationMs = ((SystemClock.elapsedRealtimeNanos() - startedAtNs) / 1_000_000L)
+                .coerceAtLeast(0L)
+            TrackerRuntime.lastOcrDurationMs = durationMs
+            TrackerRuntime.totalOcrDurationMs += durationMs
+            if (durationMs > TrackerRuntime.maxOcrDurationMs) {
+                TrackerRuntime.maxOcrDurationMs = durationMs
+            }
+
+            val now = System.currentTimeMillis()
+            if (durationMs >= SLOW_OCR_LOG_THRESHOLD_MS &&
+                now - lastSlowOcrLoggedAtMs >= SLOW_OCR_LOG_COOLDOWN_MS
+            ) {
+                lastSlowOcrLoggedAtMs = now
+                queueDiagnosticsSnapshot(
+                    event = "slow_ocr",
+                    extra = JSONObject().put("durationMs", durationMs)
+                )
+            }
+        }
+
         if (result.textPreview.isNotBlank()) {
             TrackerRuntime.lastOcrText = result.textPreview
         }
 
         if (result.error != null) {
             TrackerRuntime.lastMessage = "Light OCR error: ${result.error}"
+            queueDiagnosticsSnapshot(
+                event = "ocr_error",
+                extra = JSONObject().put("message", result.error)
+            )
             scheduleNextProbe(PROBE_INTERVAL_MS)
             return
         }
@@ -264,6 +336,10 @@ class CaptureService : Service() {
             if (resultArmed) {
                 resultArmed = false
                 TrackerRuntime.lastMessage = "Result-like OCR hit [$words]; capturing native frame"
+                queueDiagnosticsSnapshot(
+                    event = "ocr_result_hit",
+                    extra = JSONObject().put("keywords", words)
+                )
                 beginNativeResultCapture()
                 return
             }
@@ -345,9 +421,19 @@ class CaptureService : Service() {
                 TrackerRuntime.capturedScreens += 1
                 TrackerRuntime.lastCapturePath = file.absolutePath
                 TrackerRuntime.lastMessage = "Saved result screen: ${file.name}"
+                queueDiagnosticsSnapshot(
+                    event = "native_capture_saved",
+                    extra = JSONObject()
+                        .put("file", file.name)
+                        .put("capturedAtMs", capturedAtMs)
+                )
             } catch (error: Throwable) {
                 TrackerRuntime.lastMessage =
                     "Result screenshot save failed: ${error.message ?: error.javaClass.simpleName}"
+                queueDiagnosticsSnapshot(
+                    event = "native_capture_save_error",
+                    extra = JSONObject().put("message", TrackerRuntime.lastMessage)
+                )
             } finally {
                 bitmap.recycle()
             }
@@ -400,6 +486,14 @@ class CaptureService : Service() {
         if (newProbeWidth == probeWidth && newProbeHeight == probeHeight) return
 
         rebuildProbeReader(width, height)
+        queueDiagnosticsSnapshot(
+            event = "probe_resized",
+            extra = JSONObject()
+                .put("sourceWidth", width)
+                .put("sourceHeight", height)
+                .put("probeWidth", probeWidth)
+                .put("probeHeight", probeHeight)
+        )
     }
 
     private fun rebuildProbeReader(sourceW: Int, sourceH: Int) {
@@ -481,16 +575,38 @@ class CaptureService : Service() {
         return cropped
     }
 
+    private fun queueDiagnosticsSnapshot(event: String? = null, extra: JSONObject? = null) {
+        if (!ownsSession) return
+        val snapshot = diagnosticStore.snapshotFromRuntime()
+        runCatching {
+            diagnosticExecutor.execute {
+                diagnosticStore.saveSnapshot(snapshot)
+                if (event != null) diagnosticStore.appendEvent(event, snapshot, extra)
+            }
+        }
+    }
+
+    private fun saveDiagnosticsNow(event: String? = null, appendEvent: Boolean = false) {
+        if (!ownsSession) return
+        val snapshot = diagnosticStore.snapshotFromRuntime()
+        diagnosticStore.saveSnapshot(snapshot)
+        if (appendEvent && event != null) {
+            diagnosticStore.appendEvent(event, snapshot)
+        }
+    }
+
     private fun shutdownProjection(requestProjectionStop: Boolean) {
         if (!shuttingDown.compareAndSet(false, true)) return
 
         TrackerRuntime.active = false
         probeInFlight = false
+        probeStartedAtNs = 0L
         burstInProgress = false
 
         if (::captureHandler.isInitialized) {
             captureHandler.removeCallbacks(probeRunnable)
             captureHandler.removeCallbacks(burstTimeoutRunnable)
+            captureHandler.removeCallbacks(diagnosticRunnable)
         }
 
         runCatching { virtualDisplay?.setSurface(null) }
@@ -509,6 +625,10 @@ class CaptureService : Service() {
         }
 
         TrackerRuntime.captureSize = "-"
+        if (ownsSession) {
+            saveDiagnosticsNow("session_stop", appendEvent = true)
+            ownsSession = false
+        }
     }
 
     private fun createNotificationChannel() {
@@ -555,6 +675,7 @@ class CaptureService : Service() {
     companion object {
         const val ACTION_START = "com.example.rhythmtracker.action.START"
         const val ACTION_STOP = "com.example.rhythmtracker.action.STOP"
+        const val ACTION_FLUSH_DIAGNOSTICS = "com.example.rhythmtracker.action.FLUSH_DIAGNOSTICS"
         const val EXTRA_RESULT_CODE = "projection_result_code"
         const val EXTRA_RESULT_DATA = "projection_result_data"
 
@@ -567,5 +688,9 @@ class CaptureService : Service() {
         private const val BURST_TIMEOUT_MS = 1_500L
         private const val BURST_FRAME_TARGET = 2
         private const val REARM_AFTER_MISSES = 2
+
+        private const val DIAGNOSTIC_SNAPSHOT_INTERVAL_MS = 15_000L
+        private const val SLOW_OCR_LOG_THRESHOLD_MS = 200L
+        private const val SLOW_OCR_LOG_COOLDOWN_MS = 30_000L
     }
 }
