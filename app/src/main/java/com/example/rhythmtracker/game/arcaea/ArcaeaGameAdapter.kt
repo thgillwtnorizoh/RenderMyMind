@@ -4,11 +4,11 @@ import com.example.rhythmtracker.game.GameAdapter
 import com.example.rhythmtracker.game.LightTextDecision
 
 /**
- * First Arcaea-specific result gate.
+ * Arcaea-specific result gate.
  *
- * PURE / FAR / LOST are intentionally the strongest anchors because they occur together on
- * Arcaea result screens and are much less generic than words such as RESULT or CLEAR.
- * This is still a tuning baseline until we have a representative screenshot corpus.
+ * TRACK COMPLETE / TRACK LOST are strong enough by themselves because this adapter only runs
+ * while tracking Arcaea. PURE / FAR / LOST remain useful corroborating anchors, and Arcaea's
+ * punctuated score format (for example 09'430'816) is normalized before score detection.
  */
 class ArcaeaGameAdapter : GameAdapter {
     override val gameId: String = "arcaea"
@@ -22,15 +22,16 @@ class ArcaeaGameAdapter : GameAdapter {
         }
 
         val judgementCount = JUDGEMENT_ANCHORS.count { it in matched }
-        val hasResultHeader = RESULT_HEADERS.any { it in matched }
-        val hasScoreLikeNumber = SCORE_LIKE_NUMBER.containsMatchIn(normalizedText)
-
-        // Two judgement labels are already a strong Arcaea signature. One judgement label
-        // needs another independent result-screen signal to wake native-resolution capture.
-        val resultLike = judgementCount >= 2 ||
-            (judgementCount >= 1 && (hasResultHeader || hasScoreLikeNumber))
+        val hasStrongTrackState = STRONG_RESULT_HEADERS.any { it in matched }
+        val hasMaxRecall = "MAX RECALL" in matched
+        val hasScoreLikeNumber = containsArcaeaScore(normalizedText)
 
         if (hasScoreLikeNumber) matched += "SCORE_NUMBER"
+
+        val resultLike = hasStrongTrackState ||
+            judgementCount >= 2 ||
+            (judgementCount >= 1 && (hasMaxRecall || hasScoreLikeNumber)) ||
+            (hasMaxRecall && hasScoreLikeNumber)
 
         return LightTextDecision(
             isResultLike = resultLike,
@@ -38,12 +39,22 @@ class ArcaeaGameAdapter : GameAdapter {
         )
     }
 
+    private fun containsArcaeaScore(text: String): Boolean {
+        return SCORE_CANDIDATE.findAll(text).any { match ->
+            match.value.count { it.isDigit() } in 7..8
+        }
+    }
+
     companion object {
         private val JUDGEMENT_ANCHORS = setOf("PURE", "FAR", "LOST")
-        private val RESULT_HEADERS = setOf("TRACK COMPLETE", "TRACK LOST", "MAX RECALL")
+        private val STRONG_RESULT_HEADERS = setOf("TRACK COMPLETE", "TRACK LOST")
+        private val RESULT_HEADERS = STRONG_RESULT_HEADERS + "MAX RECALL"
         private val ANCHORS = JUDGEMENT_ANCHORS + RESULT_HEADERS
 
-        // This is only an extra corroborating signal, never enough by itself to declare a result.
-        private val SCORE_LIKE_NUMBER = Regex("(?<!\\d)\\d{7,8}(?!\\d)")
+        // Accept separators Arcaea commonly renders between score groups. The digit count is
+        // checked separately so timestamps and small counters do not become score signals.
+        private val SCORE_CANDIDATE = Regex(
+            "(?<!\\d)\\d(?:[\\d'’.,\\s]{5,14})\\d(?!\\d)"
+        )
     }
 }
