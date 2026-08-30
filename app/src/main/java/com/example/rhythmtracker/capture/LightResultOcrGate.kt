@@ -15,11 +15,15 @@ import java.util.concurrent.Executor
 import kotlin.math.roundToInt
 
 /**
- * Low-cost OCR sentinel. OCR mechanics live here; game-specific interpretation does not.
+ * Two-stage OCR:
  *
- * Four small Arcaea result regions are cropped and stacked into one compact bitmap. That keeps
- * this at one ML Kit invocation per probe while giving each important UI area much more OCR
- * resolution than one giant result-screen crop.
+ * 1. LIGHT runs continuously on the deliberately tiny MediaProjection surface and only needs to
+ *    decide whether a result screen is probably present.
+ * 2. NATIVE runs once after that gate fires, using the full-resolution result frame for title,
+ *    score and judgement text that the 480 px probe physically cannot preserve.
+ *
+ * Both stages use the same four normalized regions so the vision overlay always represents real
+ * OCR input rather than decorative boxes.
  */
 class LightResultOcrGate(
     private val gameAdapter: GameAdapter = ArcaeaGameAdapter()
@@ -32,12 +36,46 @@ class LightResultOcrGate(
         callbackExecutor: Executor,
         callback: (LightOcrResult) -> Unit
     ) {
-        val probe = createCompositeProbe(frame)
+        inspectInternal(
+            frame = frame,
+            pass = OcrPass.LIGHT,
+            targetWidthPx = LIGHT_REGION_WIDTH_PX,
+            minRegionHeightPx = LIGHT_MIN_REGION_HEIGHT_PX,
+            callbackExecutor = callbackExecutor,
+            callback = callback
+        )
+    }
+
+    /** Run once on the native result frame after the cheap gate has fired. */
+    fun inspectNative(
+        frame: Bitmap,
+        callbackExecutor: Executor,
+        callback: (LightOcrResult) -> Unit
+    ) {
+        inspectInternal(
+            frame = frame,
+            pass = OcrPass.NATIVE,
+            targetWidthPx = NATIVE_REGION_WIDTH_PX,
+            minRegionHeightPx = NATIVE_MIN_REGION_HEIGHT_PX,
+            callbackExecutor = callbackExecutor,
+            callback = callback
+        )
+    }
+
+    private fun inspectInternal(
+        frame: Bitmap,
+        pass: OcrPass,
+        targetWidthPx: Int,
+        minRegionHeightPx: Int,
+        callbackExecutor: Executor,
+        callback: (LightOcrResult) -> Unit
+    ) {
+        val probe = createCompositeProbe(frame, targetWidthPx, minRegionHeightPx)
         val image = InputImage.fromBitmap(probe.bitmap, 0)
 
         recognizer.process(image)
             .addOnSuccessListener(callbackExecutor) { text ->
-                val result = classify(text, probe.segments)
+                val result = classify(text, probe.segments, pass)
                 VisionDebugState.update(result)
                 callback(result)
             }
@@ -47,6 +85,7 @@ class LightResultOcrGate(
                     matchedKeywords = emptySet(),
                     textPreview = "",
                     regionReadings = emptyRegionReadings(),
+                    pass = pass,
                     error = error.message ?: error.javaClass.simpleName
                 )
                 VisionDebugState.update(result)
@@ -61,15 +100,19 @@ class LightResultOcrGate(
         recognizer.close()
     }
 
-    private fun classify(text: Text, segments: List<CompositeSegment>): LightOcrResult {
+    private fun classify(
+        text: Text,
+        segments: List<CompositeSegment>,
+        pass: OcrPass
+    ): LightOcrResult {
         val linesByRegion = OcrProbeRegion.ALL.associate { it.key to mutableListOf<String>() }
 
         text.textBlocks.forEach { block ->
-            block.lines.forEach { line ->
-                val bounds = line.boundingBox ?: return@forEach
+            block.lines.forEach lineLoop@{ line ->
+                val bounds = line.boundingBox ?: return@lineLoop
                 val centerY = (bounds.top + bounds.bottom) / 2
                 val segment = segments.firstOrNull { centerY >= it.top && centerY < it.bottom }
-                    ?: return@forEach
+                    ?: return@lineLoop
                 linesByRegion.getValue(segment.region.key) += line.text
             }
         }
@@ -83,8 +126,8 @@ class LightResultOcrGate(
         }
 
         val mappedText = readings.joinToString(" ") { it.text }.trim()
-        // Bounding boxes should normally map every line. Keep the aggregate OCR text as a
-        // defensive fallback so a future ML Kit quirk cannot silently disable the result gate.
+        // Bounding boxes should normally map every line. Keep aggregate OCR text as a defensive
+        // fallback so a future ML Kit quirk cannot silently disable the result gate.
         val normalised = if (mappedText.isNotBlank()) mappedText else normalize(text.text)
         val decision = gameAdapter.classifyLightText(normalised)
 
@@ -93,11 +136,16 @@ class LightResultOcrGate(
             matchedKeywords = decision.matchedAnchors,
             textPreview = normalised.take(MAX_PREVIEW_CHARS),
             regionReadings = readings,
+            pass = pass,
             error = null
         )
     }
 
-    private fun createCompositeProbe(frame: Bitmap): CompositeProbe {
+    private fun createCompositeProbe(
+        frame: Bitmap,
+        targetWidthPx: Int,
+        minRegionHeightPx: Int
+    ): CompositeProbe {
         val rendered = ArrayList<Pair<OcrProbeRegionSpec, Bitmap>>(OcrProbeRegion.ALL.size)
 
         OcrProbeRegion.ALL.forEach { region ->
@@ -108,23 +156,32 @@ class LightResultOcrGate(
 
             val cropped = Bitmap.createBitmap(frame, left, top, right - left, bottom - top)
             val targetHeight = (
-                cropped.height * (OCR_REGION_WIDTH_PX.toFloat() / cropped.width.toFloat())
-            ).roundToInt().coerceAtLeast(MIN_REGION_HEIGHT_PX)
+                cropped.height * (targetWidthPx.toFloat() / cropped.width.toFloat())
+            ).roundToInt().coerceAtLeast(minRegionHeightPx)
 
-            val scaled = Bitmap.createScaledBitmap(
-                cropped,
-                OCR_REGION_WIDTH_PX,
-                targetHeight,
-                true
-            )
-            cropped.recycle()
+            // Never downscale the native crop below its original width. At result time OCR is a
+            // one-shot operation, so preserving real glyph pixels matters more than saving a few
+            // hundred kilobytes.
+            val outputWidth = if (targetWidthPx >= cropped.width) targetWidthPx else cropped.width
+            val outputHeight = (
+                cropped.height * (outputWidth.toFloat() / cropped.width.toFloat())
+            ).roundToInt().coerceAtLeast(minRegionHeightPx)
+
+            val scaled = if (cropped.width == outputWidth && cropped.height == outputHeight) {
+                cropped
+            } else {
+                Bitmap.createScaledBitmap(cropped, outputWidth, outputHeight, true).also {
+                    cropped.recycle()
+                }
+            }
             rendered += region to scaled
         }
 
+        val compositeWidth = rendered.maxOfOrNull { it.second.width } ?: targetWidthPx
         val totalHeight = rendered.sumOf { it.second.height } +
             COMPOSITE_GUTTER_PX * (rendered.size - 1).coerceAtLeast(0)
         val composite = Bitmap.createBitmap(
-            OCR_REGION_WIDTH_PX,
+            compositeWidth.coerceAtLeast(2),
             totalHeight.coerceAtLeast(2),
             Bitmap.Config.ARGB_8888
         )
@@ -139,9 +196,7 @@ class LightResultOcrGate(
             y += bitmap.height
             bitmap.recycle()
 
-            if (index != rendered.lastIndex) {
-                y += COMPOSITE_GUTTER_PX
-            }
+            if (index != rendered.lastIndex) y += COMPOSITE_GUTTER_PX
         }
 
         return CompositeProbe(composite, segments)
@@ -168,11 +223,22 @@ class LightResultOcrGate(
     )
 
     companion object {
-        private const val OCR_REGION_WIDTH_PX = 320
-        private const val MIN_REGION_HEIGHT_PX = 42
-        private const val COMPOSITE_GUTTER_PX = 10
-        private const val MAX_PREVIEW_CHARS = 240
+        private const val LIGHT_REGION_WIDTH_PX = 320
+        private const val LIGHT_MIN_REGION_HEIGHT_PX = 42
+
+        // Native crops on a typical tablet/phone are already 400-700 px wide. Keep at least that
+        // real resolution, only enlarging genuinely smaller crops.
+        private const val NATIVE_REGION_WIDTH_PX = 720
+        private const val NATIVE_MIN_REGION_HEIGHT_PX = 96
+
+        private const val COMPOSITE_GUTTER_PX = 12
+        private const val MAX_PREVIEW_CHARS = 320
     }
+}
+
+enum class OcrPass {
+    LIGHT,
+    NATIVE
 }
 
 data class OcrRegionReading(
@@ -186,5 +252,6 @@ data class LightOcrResult(
     val matchedKeywords: Set<String>,
     val textPreview: String,
     val regionReadings: List<OcrRegionReading>,
+    val pass: OcrPass,
     val error: String?
 )
