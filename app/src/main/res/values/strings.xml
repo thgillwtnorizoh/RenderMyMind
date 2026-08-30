@@ -1,6 +1,8 @@
 <resources>
     <string name="app_name">RenderMyMind Alpha</string>
     <string name="import_database">Import Arcaea database</string>
+    <string name="vision_overlay">Vision debug overlay</string>
+    <string name="vision_overlay_hint">Show the live OCR box and what the Arcaea gate thinks it sees. Requires Android draw-over-other-apps permission.</string>
     <string name="start_tracking">Start tracking</string>
     <string name="stop_tracking">Stop tracking</string>
     <string name="export_results">Export results</string>
