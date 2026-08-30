@@ -11,9 +11,12 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.widget.Button
+import android.widget.Switch
 import android.widget.TextView
 import com.example.rhythmtracker.capture.CaptureService
+import com.example.rhythmtracker.capture.VisionDebugOverlay
 import com.example.rhythmtracker.data.DiagnosticSnapshot
 import com.example.rhythmtracker.data.DiagnosticStore
 import com.example.rhythmtracker.data.FileResultStore
@@ -28,6 +31,7 @@ class MainActivity : Activity() {
 
     private lateinit var projectionManager: MediaProjectionManager
     private lateinit var statusText: TextView
+    private lateinit var visionOverlaySwitch: Switch
     private lateinit var diagnosticStore: DiagnosticStore
     private lateinit var resultStore: FileResultStore
     private lateinit var databaseStore: ArcaeaDatabaseStore
@@ -38,6 +42,8 @@ class MainActivity : Activity() {
 
     private val uiHandler = Handler(Looper.getMainLooper())
     private var pendingCaptureStart = false
+    private var pendingOverlayEnable = false
+    private var suppressOverlaySwitchCallback = false
 
     private val refreshRunnable = object : Runnable {
         override fun run() {
@@ -56,12 +62,16 @@ class MainActivity : Activity() {
         databaseStore = ArcaeaDatabaseStore(this)
         persistedSnapshot = diagnosticStore.readSnapshot()
         statusText = findViewById(R.id.statusText)
+        visionOverlaySwitch = findViewById(R.id.visionOverlaySwitch)
+
+        configureVisionOverlaySwitch()
 
         findViewById<Button>(R.id.startButton).setOnClickListener {
             beginTrackingFlow()
         }
 
         findViewById<Button>(R.id.stopButton).setOnClickListener {
+            VisionDebugOverlay.stop()
             startService(Intent(this, CaptureService::class.java).apply {
                 action = CaptureService.ACTION_STOP
             })
@@ -91,6 +101,21 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+
+        if (pendingOverlayEnable) {
+            pendingOverlayEnable = false
+            val granted = Settings.canDrawOverlays(this)
+            setVisionOverlayEnabled(granted)
+            TrackerRuntime.lastMessage = if (granted) {
+                "Vision overlay enabled; it will appear while tracking"
+            } else {
+                "Vision overlay permission was not granted"
+            }
+        } else if (visionOverlayPreference() && !Settings.canDrawOverlays(this)) {
+            // Permission may have been revoked in Android settings while the app was away.
+            setVisionOverlayEnabled(false)
+        }
+
         persistedSnapshot = diagnosticStore.readSnapshot()
         uiHandler.post(refreshRunnable)
     }
@@ -98,6 +123,43 @@ class MainActivity : Activity() {
     override fun onPause() {
         uiHandler.removeCallbacks(refreshRunnable)
         super.onPause()
+    }
+
+    private fun configureVisionOverlaySwitch() {
+        val stored = visionOverlayPreference()
+        val usable = stored && Settings.canDrawOverlays(this)
+        if (stored && !usable) {
+            preferences().edit().putBoolean(PREF_VISION_OVERLAY, false).apply()
+        }
+        setVisionOverlaySwitchChecked(usable)
+
+        visionOverlaySwitch.setOnCheckedChangeListener { _, checked ->
+            if (suppressOverlaySwitchCallback) return@setOnCheckedChangeListener
+
+            if (!checked) {
+                setVisionOverlayEnabled(false)
+                VisionDebugOverlay.stop()
+                TrackerRuntime.lastMessage = "Vision overlay disabled"
+                return@setOnCheckedChangeListener
+            }
+
+            if (Settings.canDrawOverlays(this)) {
+                setVisionOverlayEnabled(true)
+                if (TrackerRuntime.active) VisionDebugOverlay.start(applicationContext)
+                TrackerRuntime.lastMessage = "Vision overlay enabled"
+                return@setOnCheckedChangeListener
+            }
+
+            pendingOverlayEnable = true
+            setVisionOverlaySwitchChecked(false)
+            TrackerRuntime.lastMessage = "Grant Draw over other apps for the vision overlay"
+            startActivity(
+                Intent(
+                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:$packageName")
+                )
+            )
+        }
     }
 
     private fun beginTrackingFlow() {
@@ -185,6 +247,7 @@ class MainActivity : Activity() {
 
     private fun handleCaptureResult(resultCode: Int, data: Intent?) {
         if (resultCode != RESULT_OK || data == null) {
+            VisionDebugOverlay.stop()
             TrackerRuntime.lastMessage = "Screen capture permission was not granted"
             return
         }
@@ -195,6 +258,11 @@ class MainActivity : Activity() {
             putExtra(CaptureService.EXTRA_RESULT_DATA, data)
         }
         startForegroundService(serviceIntent)
+
+        if (visionOverlayPreference() && Settings.canDrawOverlays(this)) {
+            VisionDebugOverlay.start(applicationContext)
+        }
+
         TrackerRuntime.lastMessage = "Starting RenderMyMind Alpha projection service…"
     }
 
@@ -305,6 +373,7 @@ class MainActivity : Activity() {
             buildString {
                 appendLine("ARCAEA DATABASE")
                 appendLine("database         : $databaseStatus")
+                appendLine("vision overlay   : ${visionOverlayStatus()}")
                 appendLine("results JSONL    : ${resultStore.sizeBytes()} bytes")
                 appendLine()
                 append("No persisted tracking session yet.\n\nStart tracking to create diagnostics.")
@@ -317,6 +386,7 @@ class MainActivity : Activity() {
         return buildString {
             appendLine("LIVE SESSION")
             appendLine("database         : $databaseStatus")
+            appendLine("vision overlay   : ${visionOverlayStatus()}")
             appendLine("session          : ${TrackerRuntime.sessionId}")
             appendLine("tracking         : ${TrackerRuntime.active}")
             appendLine("capture mode     : ${TrackerRuntime.captureSize}")
@@ -338,6 +408,7 @@ class MainActivity : Activity() {
     private fun persistedSnapshotText(snapshot: DiagnosticSnapshot): String = buildString {
         appendLine("PERSISTED LAST SESSION")
         appendLine("database         : $databaseStatus")
+        appendLine("vision overlay   : ${visionOverlayStatus()}")
         appendLine("results JSONL    : ${resultStore.sizeBytes()} bytes")
         appendLine("version          : ${snapshot.version}")
         appendLine("session          : ${snapshot.sessionId}")
@@ -359,6 +430,29 @@ class MainActivity : Activity() {
         append(snapshot.lastMessage)
     }
 
+    private fun visionOverlayPreference(): Boolean =
+        preferences().getBoolean(PREF_VISION_OVERLAY, false)
+
+    private fun visionOverlayStatus(): String = when {
+        !visionOverlayPreference() -> "off"
+        !Settings.canDrawOverlays(this) -> "permission missing"
+        TrackerRuntime.active -> "on / live"
+        else -> "on / armed"
+    }
+
+    private fun setVisionOverlayEnabled(enabled: Boolean) {
+        preferences().edit().putBoolean(PREF_VISION_OVERLAY, enabled).apply()
+        setVisionOverlaySwitchChecked(enabled)
+    }
+
+    private fun setVisionOverlaySwitchChecked(checked: Boolean) {
+        suppressOverlaySwitchCallback = true
+        visionOverlaySwitch.isChecked = checked
+        suppressOverlaySwitchCallback = false
+    }
+
+    private fun preferences() = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+
     private fun formatTime(timestampMs: Long): String {
         if (timestampMs == 0L) return "-"
         return SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(Date(timestampMs))
@@ -375,5 +469,8 @@ class MainActivity : Activity() {
         private const val REQUEST_EXPORT_DIAGNOSTICS = 4103
         private const val REQUEST_IMPORT_DATABASE = 4104
         private const val REQUEST_EXPORT_RESULTS = 4105
+
+        private const val PREFS_NAME = "rendermymind_preferences"
+        private const val PREF_VISION_OVERLAY = "vision_overlay_enabled"
     }
 }
