@@ -2,9 +2,10 @@ package com.example.rhythmtracker.data
 
 import android.content.Context
 import android.graphics.Bitmap
+import com.example.rhythmtracker.capture.NativeResultVisionOcr
 import java.io.File
 
-/** Stores v0.2 native-resolution result-screen evidence in private app storage. */
+/** Stores native-resolution result-screen evidence in private app storage. */
 class ResultCaptureStore(context: Context) {
     private val directory = File(context.filesDir, "result-captures")
 
@@ -18,6 +19,10 @@ class ResultCaptureStore(context: Context) {
                 "Bitmap.compress() returned false"
             }
         }
+
+        // submit() copies its OCR regions synchronously. CaptureService may safely recycle the
+        // native bitmap as soon as this method returns while ML Kit continues asynchronously.
+        NativeResultVisionOcr.submit(bitmap)
         return file
     }
 }
