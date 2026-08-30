@@ -15,7 +15,6 @@ import android.view.View
 import android.view.WindowManager
 import com.example.rhythmtracker.TrackerRuntime
 import java.util.concurrent.atomic.AtomicReference
-import kotlin.math.max
 
 /** Latest OCR decision published by LightResultOcrGate for the optional visual debugger. */
 data class VisionDebugSnapshot(
@@ -23,6 +22,7 @@ data class VisionDebugSnapshot(
     val resultLike: Boolean,
     val matchedAnchors: Set<String>,
     val textPreview: String,
+    val regionReadings: List<OcrRegionReading>,
     val error: String?
 )
 
@@ -33,6 +33,9 @@ object VisionDebugState {
             resultLike = false,
             matchedAnchors = emptySet(),
             textPreview = "",
+            regionReadings = OcrProbeRegion.ALL.map {
+                OcrRegionReading(it.key, it.label, "")
+            },
             error = null
         )
     )
@@ -44,6 +47,7 @@ object VisionDebugState {
                 resultLike = result.isResultLike,
                 matchedAnchors = result.matchedKeywords.toSet(),
                 textPreview = result.textPreview,
+                regionReadings = result.regionReadings,
                 error = result.error
             )
         )
@@ -55,9 +59,9 @@ object VisionDebugState {
 /**
  * Optional TYPE_APPLICATION_OVERLAY debugger.
  *
- * The window is transparent and completely non-touchable. It draws the exact normalized ROI
- * used by LightResultOcrGate, then shows the latest Arcaea judgement-anchor interpretation just
- * above that rectangle. It automatically removes itself after the tracking session stops.
+ * The window is transparent and completely non-touchable. Every rectangle is one real OCR crop
+ * used by LightResultOcrGate. Its corresponding readout is drawn in the unused left margin so
+ * the debugger text itself does not sit inside any OCR crop and teach OCR its own answer.
  */
 object VisionDebugOverlay {
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -89,7 +93,6 @@ object VisionDebugOverlay {
                 return
             }
 
-            // Give CaptureService a moment to transition from startForegroundService() to active.
             if (!seenActiveSession && System.currentTimeMillis() - requestedAtMs < START_GRACE_MS) {
                 mainHandler.postDelayed(this, REFRESH_MS)
                 return
@@ -178,18 +181,18 @@ private class VisionDebugView(context: Context) : View(context) {
     }
     private val labelBackgroundPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
-        color = Color.argb(210, 16, 18, 22)
+        color = Color.argb(215, 16, 18, 22)
     }
-    private val primaryTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    private val labelTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
         color = Color.WHITE
-        textSize = 13f * resources.displayMetrics.scaledDensity
+        textSize = 10.5f * resources.displayMetrics.scaledDensity
         typeface = android.graphics.Typeface.MONOSPACE
     }
-    private val secondaryTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    private val statusTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
-        color = Color.rgb(205, 211, 220)
-        textSize = 10f * resources.displayMetrics.scaledDensity
+        color = Color.WHITE
+        textSize = 11.5f * resources.displayMetrics.scaledDensity
         typeface = android.graphics.Typeface.MONOSPACE
     }
 
@@ -197,85 +200,90 @@ private class VisionDebugView(context: Context) : View(context) {
         super.onDraw(canvas)
         if (width <= 0 || height <= 0) return
 
-        val roi = RectF(
-            width * OcrProbeRegion.LEFT,
-            height * OcrProbeRegion.TOP,
-            width * OcrProbeRegion.RIGHT,
-            height * OcrProbeRegion.BOTTOM
-        )
+        drawGateStatus(canvas)
 
-        borderPaint.color = if (snapshot.resultLike) {
-            Color.rgb(108, 232, 155)
-        } else {
-            Color.rgb(106, 194, 255)
+        val readings = snapshot.regionReadings.associateBy { it.key }
+        OcrProbeRegion.ALL.forEach { region ->
+            val roi = RectF(
+                width * region.left,
+                height * region.top,
+                width * region.right,
+                height * region.bottom
+            )
+            val reading = readings[region.key]?.text.orEmpty()
+
+            borderPaint.color = when {
+                snapshot.resultLike -> Color.rgb(103, 230, 151)
+                reading.isNotBlank() -> Color.rgb(255, 200, 92)
+                else -> Color.rgb(103, 190, 255)
+            }
+            canvas.drawRect(roi, borderPaint)
+            drawRegionReadout(canvas, region, roi, reading)
         }
-        canvas.drawRect(roi, borderPaint)
-
-        val line1 = judgementLine(snapshot)
-        val line2 = detailLine(snapshot)
-        drawLabel(canvas, roi, line1, line2)
     }
 
-    private fun judgementLine(snapshot: VisionDebugSnapshot): String {
-        fun marker(anchor: String): String = if (anchor in snapshot.matchedAnchors) "✓" else "·"
-        val gate = when {
+    private fun drawGateStatus(canvas: Canvas) {
+        val state = when {
             snapshot.error != null -> "OCR ERROR"
             snapshot.resultLike -> "RESULT-LIKE"
             snapshot.updatedAtMs == 0L -> "WAITING"
             System.currentTimeMillis() - snapshot.updatedAtMs > STALE_AFTER_MS -> "STALE"
             else -> "SCANNING"
         }
-        return "PURE ${marker("PURE")}  FAR ${marker("FAR")}  LOST ${marker("LOST")}  |  $gate"
+
+        val anchors = snapshot.matchedAnchors.joinToString(", ").ifBlank { "none" }
+        val text = "VISION: $state  |  anchors: $anchors"
+        val padding = 6f * density
+        val maxWidth = width * 0.27f - padding * 2
+        val fitted = fitText(text, statusTextPaint, maxWidth)
+        val h = statusTextPaint.fontMetrics.run { bottom - top } + padding * 2
+        val box = RectF(padding, padding, width * 0.27f, padding + h)
+        canvas.drawRoundRect(box, 5f * density, 5f * density, labelBackgroundPaint)
+        val baseline = box.top + padding - statusTextPaint.fontMetrics.top
+        canvas.drawText(fitted, box.left + padding, baseline, statusTextPaint)
     }
 
-    private fun detailLine(snapshot: VisionDebugSnapshot): String {
-        snapshot.error?.let { return it.take(MAX_DETAIL_CHARS) }
-
-        val extras = snapshot.matchedAnchors
-            .filterNot { it == "PURE" || it == "FAR" || it == "LOST" }
-            .joinToString(" ")
-
-        val preview = snapshot.textPreview
-            .replace('\n', ' ')
-            .replace(Regex("\\s+"), " ")
-            .trim()
-
-        return when {
-            extras.isNotBlank() && preview.isNotBlank() -> "$extras | OCR: ${preview.take(MAX_PREVIEW_CHARS)}"
-            extras.isNotBlank() -> extras
-            preview.isNotBlank() -> "OCR: ${preview.take(MAX_PREVIEW_CHARS)}"
-            else -> "OCR: (no text)"
-        }.take(MAX_DETAIL_CHARS)
-    }
-
-    private fun drawLabel(canvas: Canvas, roi: RectF, line1: String, line2: String) {
-        val paddingX = 7f * density
-        val paddingY = 5f * density
-        val gap = 2f * density
-        val line1Height = primaryTextPaint.fontMetrics.run { bottom - top }
-        val line2Height = secondaryTextPaint.fontMetrics.run { bottom - top }
-        val textWidth = max(
-            primaryTextPaint.measureText(line1),
-            secondaryTextPaint.measureText(line2)
+    private fun drawRegionReadout(
+        canvas: Canvas,
+        region: OcrProbeRegionSpec,
+        roi: RectF,
+        reading: String
+    ) {
+        val outerPadding = 6f * density
+        val innerPadding = 5f * density
+        val left = outerPadding
+        val right = (roi.left - outerPadding).coerceAtLeast(left + 40f * density)
+        val lineHeight = labelTextPaint.fontMetrics.run { bottom - top }
+        val boxHeight = lineHeight * 2 + innerPadding * 2
+        val preferredTop = roi.top
+        val top = preferredTop.coerceIn(
+            outerPadding,
+            (height - boxHeight - outerPadding).coerceAtLeast(outerPadding)
         )
-        val boxWidth = textWidth + paddingX * 2
-        val boxHeight = line1Height + line2Height + gap + paddingY * 2
+        val box = RectF(left, top, right, top + boxHeight)
+        canvas.drawRoundRect(box, 5f * density, 5f * density, labelBackgroundPaint)
 
-        val left = roi.left.coerceIn(0f, max(0f, width - boxWidth))
-        val preferredTop = roi.top - boxHeight - 4f * density
-        val top = preferredTop.coerceAtLeast(0f)
-        val box = RectF(left, top, left + boxWidth, top + boxHeight)
-        canvas.drawRoundRect(box, 6f * density, 6f * density, labelBackgroundPaint)
+        val label = "${region.label}:"
+        val value = if (reading.isBlank()) "(no text)" else reading
+        val maxTextWidth = (box.width() - innerPadding * 2).coerceAtLeast(1f)
+        val line1 = fitText(label, labelTextPaint, maxTextWidth)
+        val line2 = fitText(value, labelTextPaint, maxTextWidth)
+        val firstBaseline = box.top + innerPadding - labelTextPaint.fontMetrics.top
+        val secondBaseline = firstBaseline + lineHeight
+        canvas.drawText(line1, box.left + innerPadding, firstBaseline, labelTextPaint)
+        canvas.drawText(line2, box.left + innerPadding, secondBaseline, labelTextPaint)
+    }
 
-        val line1Y = top + paddingY - primaryTextPaint.fontMetrics.top
-        val line2Y = line1Y + line1Height + gap
-        canvas.drawText(line1, left + paddingX, line1Y, primaryTextPaint)
-        canvas.drawText(line2, left + paddingX, line2Y, secondaryTextPaint)
+    private fun fitText(text: String, paint: Paint, maxWidth: Float): String {
+        if (paint.measureText(text) <= maxWidth) return text
+        if (maxWidth <= paint.measureText("…")) return ""
+
+        val available = (maxWidth - paint.measureText("…")).coerceAtLeast(0f)
+        val count = paint.breakText(text, true, available, null).coerceAtLeast(0)
+        return text.take(count).trimEnd() + "…"
     }
 
     companion object {
         private const val STALE_AFTER_MS = 2_500L
-        private const val MAX_PREVIEW_CHARS = 72
-        private const val MAX_DETAIL_CHARS = 110
     }
 }
