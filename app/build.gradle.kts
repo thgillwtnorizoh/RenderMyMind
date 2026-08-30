@@ -10,8 +10,8 @@ android {
         applicationId = "com.example.rhythmtracker"
         minSdk = 29
         targetSdk = 36
-        versionCode = 6
-        versionName = "0.3.2-alpha"
+        versionCode = 7
+        versionName = "0.3.3-alpha"
     }
 
     compileOptions {
