@@ -16,17 +16,20 @@ import android.view.WindowManager
 import com.example.rhythmtracker.TrackerRuntime
 import java.util.concurrent.atomic.AtomicReference
 
-/** Latest OCR decision published by LightResultOcrGate for the optional visual debugger. */
+/** Latest OCR decision published by the two-stage OCR pipeline. */
 data class VisionDebugSnapshot(
     val updatedAtMs: Long,
     val resultLike: Boolean,
     val matchedAnchors: Set<String>,
     val textPreview: String,
     val regionReadings: List<OcrRegionReading>,
+    val pass: OcrPass,
     val error: String?
 )
 
 object VisionDebugState {
+    private const val NATIVE_HOLD_MS = 8_000L
+
     private val latest = AtomicReference(
         VisionDebugSnapshot(
             updatedAtMs = 0L,
@@ -36,21 +39,37 @@ object VisionDebugState {
             regionReadings = OcrProbeRegion.ALL.map {
                 OcrRegionReading(it.key, it.label, "")
             },
+            pass = OcrPass.LIGHT,
             error = null
         )
     )
 
     fun update(result: LightOcrResult) {
-        latest.set(
-            VisionDebugSnapshot(
-                updatedAtMs = System.currentTimeMillis(),
+        val now = System.currentTimeMillis()
+
+        while (true) {
+            val previous = latest.get()
+            // Once we have paid for a native-resolution OCR pass, keep those useful readings on
+            // screen for a few seconds. The next 480 px probe must not instantly overwrite them
+            // with the blurry text that caused this debugging feature in the first place.
+            if (result.pass == OcrPass.LIGHT &&
+                previous.pass == OcrPass.NATIVE &&
+                now - previous.updatedAtMs < NATIVE_HOLD_MS
+            ) {
+                return
+            }
+
+            val next = VisionDebugSnapshot(
+                updatedAtMs = now,
                 resultLike = result.isResultLike,
                 matchedAnchors = result.matchedKeywords.toSet(),
                 textPreview = result.textPreview,
                 regionReadings = result.regionReadings,
+                pass = result.pass,
                 error = result.error
             )
-        )
+            if (latest.compareAndSet(previous, next)) return
+        }
     }
 
     fun snapshot(): VisionDebugSnapshot = latest.get()
@@ -59,9 +78,9 @@ object VisionDebugState {
 /**
  * Optional TYPE_APPLICATION_OVERLAY debugger.
  *
- * The window is transparent and completely non-touchable. Every rectangle is one real OCR crop
- * used by LightResultOcrGate. Its corresponding readout is drawn in the unused left margin so
- * the debugger text itself does not sit inside any OCR crop and teach OCR its own answer.
+ * Every rectangle is a real OCR crop. The left-side panels show what ML Kit actually returned.
+ * The overlay can be hidden for the brief native capture so its own borders/text do not pollute
+ * the high-quality evidence frame.
  */
 object VisionDebugOverlay {
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -73,6 +92,9 @@ object VisionDebugOverlay {
     private var requested = false
     private var seenActiveSession = false
     private var requestedAtMs = 0L
+
+    @Volatile
+    private var temporarilyHidden = false
 
     private val refreshRunnable = object : Runnable {
         override fun run() {
@@ -87,6 +109,7 @@ object VisionDebugOverlay {
             if (TrackerRuntime.active) {
                 seenActiveSession = true
                 ensureAttached(context)
+                debugView?.visibility = if (temporarilyHidden) View.INVISIBLE else View.VISIBLE
                 debugView?.snapshot = VisionDebugState.snapshot()
                 debugView?.invalidate()
                 mainHandler.postDelayed(this, REFRESH_MS)
@@ -111,14 +134,23 @@ object VisionDebugOverlay {
         requested = true
         seenActiveSession = TrackerRuntime.active
         requestedAtMs = System.currentTimeMillis()
+        temporarilyHidden = false
         mainHandler.removeCallbacks(refreshRunnable)
         mainHandler.post(refreshRunnable)
         return true
     }
 
+    fun setTemporarilyHidden(hidden: Boolean) {
+        temporarilyHidden = hidden
+        mainHandler.post {
+            debugView?.visibility = if (hidden) View.INVISIBLE else View.VISIBLE
+        }
+    }
+
     fun stop() {
         requested = false
         seenActiveSession = false
+        temporarilyHidden = false
         mainHandler.removeCallbacks(refreshRunnable)
         detach()
         appContext = null
@@ -213,6 +245,7 @@ private class VisionDebugView(context: Context) : View(context) {
             val reading = readings[region.key]?.text.orEmpty()
 
             borderPaint.color = when {
+                snapshot.pass == OcrPass.NATIVE -> Color.rgb(179, 122, 255)
                 snapshot.resultLike -> Color.rgb(103, 230, 151)
                 reading.isNotBlank() -> Color.rgb(255, 200, 92)
                 else -> Color.rgb(103, 190, 255)
@@ -232,7 +265,7 @@ private class VisionDebugView(context: Context) : View(context) {
         }
 
         val anchors = snapshot.matchedAnchors.joinToString(", ").ifBlank { "none" }
-        val text = "VISION: $state  |  anchors: $anchors"
+        val text = "VISION ${snapshot.pass}: $state  |  anchors: $anchors"
         val padding = 6f * density
         val maxWidth = width * 0.27f - padding * 2
         val fitted = fitText(text, statusTextPaint, maxWidth)
