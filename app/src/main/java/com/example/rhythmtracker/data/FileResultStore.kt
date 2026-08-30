@@ -3,12 +3,12 @@ package com.example.rhythmtracker.data
 import android.content.Context
 import org.json.JSONObject
 import java.io.File
+import java.io.OutputStream
 
 /**
- * v0 persistence: append-only JSONL in internal app storage.
+ * Append-only JSONL result store in private app storage.
  *
- * This is intentionally boring and crash-resistant for the skeleton. Replace with Room
- * once the result schema is stable enough to deserve migrations.
+ * Results are explicitly exportable so a test build never traps useful data inside the app.
  */
 class FileResultStore(context: Context) {
     private val file = File(context.filesDir, "results.jsonl")
@@ -27,4 +27,12 @@ class FileResultStore(context: Context) {
 
         file.appendText(json.toString() + "\n", Charsets.UTF_8)
     }
+
+    @Synchronized
+    fun exportTo(output: OutputStream) {
+        if (!file.exists()) return
+        file.inputStream().buffered().use { input -> input.copyTo(output) }
+    }
+
+    fun sizeBytes(): Long = if (file.exists()) file.length() else 0L
 }
