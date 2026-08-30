@@ -14,7 +14,7 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="RenderMyMind Alpha // v0.2.1"
+            android:text="RenderMyMind Alpha // v0.3"
             android:textColor="#FFFFFF"
             android:textSize="24sp"
             android:textStyle="bold" />
@@ -23,15 +23,22 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
-            android:text="Persistent low-res MediaProjection + lightweight OCR sentinel. Diagnostic state survives reopening and can be exported as JSONL."
+            android:text="Arcaea adapter foundation: import the merged cheeseburger database, run the low-cost Arcaea result gate, and keep both diagnostics and result JSONL exportable."
             android:textColor="#B8BBC2"
             android:textSize="15sp" />
+
+        <Button
+            android:id="@+id/importDatabaseButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:text="@string/import_database" />
 
         <Button
             android:id="@+id/startButton"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="24dp"
+            android:layout_marginTop="8dp"
             android:text="@string/start_tracking" />
 
         <Button
@@ -40,6 +47,13 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
             android:text="@string/stop_tracking" />
+
+        <Button
+            android:id="@+id/exportResultsButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/export_results" />
 
         <Button
             android:id="@+id/exportDiagnosticsButton"
@@ -71,7 +85,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="16dp"
-            android:text="Diagnostics are intentionally low-frequency: state is persisted every 15 seconds and at important events. OCR probes themselves do not write to disk."
+            android:text="The imported database is validated before replacing the previous copy. Missing chart constants stay missing; the tracker must never invent CC. Native result PNG capture remains evidence while OCR rules are tuned."
             android:textColor="#8E929B"
             android:textSize="13sp" />
 
