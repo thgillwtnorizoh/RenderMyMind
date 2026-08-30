@@ -18,6 +18,8 @@ import com.example.rhythmtracker.data.DiagnosticSnapshot
 import com.example.rhythmtracker.data.DiagnosticStore
 import com.example.rhythmtracker.data.FileResultStore
 import com.example.rhythmtracker.data.PlayResult
+import com.example.rhythmtracker.game.arcaea.ArcaeaChartIndex
+import com.example.rhythmtracker.game.arcaea.ArcaeaDatabaseStore
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -27,7 +29,12 @@ class MainActivity : Activity() {
     private lateinit var projectionManager: MediaProjectionManager
     private lateinit var statusText: TextView
     private lateinit var diagnosticStore: DiagnosticStore
+    private lateinit var resultStore: FileResultStore
+    private lateinit var databaseStore: ArcaeaDatabaseStore
     private var persistedSnapshot: DiagnosticSnapshot? = null
+
+    @Volatile
+    private var databaseStatus: String = "not imported"
 
     private val uiHandler = Handler(Looper.getMainLooper())
     private var pendingCaptureStart = false
@@ -45,6 +52,8 @@ class MainActivity : Activity() {
 
         projectionManager = getSystemService(MediaProjectionManager::class.java)
         diagnosticStore = DiagnosticStore(this)
+        resultStore = FileResultStore(this)
+        databaseStore = ArcaeaDatabaseStore(this)
         persistedSnapshot = diagnosticStore.readSnapshot()
         statusText = findViewById(R.id.statusText)
 
@@ -58,16 +67,26 @@ class MainActivity : Activity() {
             })
         }
 
+        findViewById<Button>(R.id.importDatabaseButton).setOnClickListener {
+            requestDatabaseImport()
+        }
+
+        findViewById<Button>(R.id.exportResultsButton).setOnClickListener {
+            requestResultsExport()
+        }
+
         findViewById<Button>(R.id.exportDiagnosticsButton).setOnClickListener {
             requestDiagnosticsExport()
         }
 
         findViewById<Button>(R.id.testRecordButton).setOnClickListener {
             val result = PlayResult.manualTest()
-            FileResultStore(this).append(result)
+            resultStore.append(result)
             TrackerRuntime.savedResults += 1
             TrackerRuntime.lastMessage = "Manual test result appended to results.jsonl"
         }
+
+        refreshDatabaseStatus()
     }
 
     override fun onResume() {
@@ -84,6 +103,12 @@ class MainActivity : Activity() {
     private fun beginTrackingFlow() {
         if (TrackerRuntime.active) {
             TrackerRuntime.lastMessage = "Tracking is already active"
+            return
+        }
+
+        if (!databaseStore.exists()) {
+            TrackerRuntime.lastMessage =
+                "Import cheeseburger-merged.json first so captured results can resolve charts"
             return
         }
 
@@ -112,6 +137,24 @@ class MainActivity : Activity() {
         startActivityForResult(intent, REQUEST_CAPTURE)
     }
 
+    private fun requestDatabaseImport() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "application/json"
+        }
+        startActivityForResult(intent, REQUEST_IMPORT_DATABASE)
+    }
+
+    private fun requestResultsExport() {
+        val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "application/json"
+            putExtra(Intent.EXTRA_TITLE, "RenderMyMind-results-$stamp.jsonl")
+        }
+        startActivityForResult(intent, REQUEST_EXPORT_RESULTS)
+    }
+
     private fun requestDiagnosticsExport() {
         if (TrackerRuntime.active) {
             startService(Intent(this, CaptureService::class.java).apply {
@@ -134,6 +177,8 @@ class MainActivity : Activity() {
 
         when (requestCode) {
             REQUEST_CAPTURE -> handleCaptureResult(resultCode, data)
+            REQUEST_IMPORT_DATABASE -> handleDatabaseImport(resultCode, data?.data)
+            REQUEST_EXPORT_RESULTS -> handleResultsExport(resultCode, data?.data)
             REQUEST_EXPORT_DIAGNOSTICS -> handleDiagnosticsExport(resultCode, data?.data)
         }
     }
@@ -151,6 +196,49 @@ class MainActivity : Activity() {
         }
         startForegroundService(serviceIntent)
         TrackerRuntime.lastMessage = "Starting RenderMyMind Alpha projection service…"
+    }
+
+    private fun handleDatabaseImport(resultCode: Int, uri: Uri?) {
+        if (resultCode != RESULT_OK || uri == null) return
+
+        databaseStatus = "importing / validating…"
+        TrackerRuntime.lastMessage = "Importing Arcaea database…"
+        renderRuntimeState()
+
+        Thread {
+            val outcome = runCatching {
+                val input = contentResolver.openInputStream(uri)
+                    ?: error("Android returned no readable input stream")
+                databaseStore.importFrom(input)
+            }
+
+            runOnUiThread {
+                outcome.onSuccess { index ->
+                    databaseStatus = databaseStatus(index)
+                    TrackerRuntime.lastMessage =
+                        "Arcaea database imported: ${index.songCount} songs / ${index.chartCount} charts"
+                }.onFailure { error ->
+                    databaseStatus = "import failed"
+                    TrackerRuntime.lastMessage =
+                        "Database import failed: ${error.message ?: error.javaClass.simpleName}"
+                }
+                renderRuntimeState()
+            }
+        }.start()
+    }
+
+    private fun handleResultsExport(resultCode: Int, uri: Uri?) {
+        if (resultCode != RESULT_OK || uri == null) return
+
+        try {
+            contentResolver.openOutputStream(uri, "w")?.use { output ->
+                resultStore.exportTo(output)
+            } ?: error("Android returned no writable output stream")
+            TrackerRuntime.lastMessage = "Results exported successfully"
+        } catch (error: Throwable) {
+            TrackerRuntime.lastMessage =
+                "Results export failed: ${error.message ?: error.javaClass.simpleName}"
+        }
     }
 
     private fun handleDiagnosticsExport(resultCode: Int, uri: Uri?) {
@@ -179,6 +267,28 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun refreshDatabaseStatus() {
+        if (!databaseStore.exists()) {
+            databaseStatus = "not imported"
+            return
+        }
+
+        databaseStatus = "loading…"
+        Thread {
+            val status = runCatching { databaseStatus(databaseStore.load()) }
+                .getOrElse { error ->
+                    "invalid: ${error.message ?: error.javaClass.simpleName}"
+                }
+            runOnUiThread {
+                databaseStatus = status
+                renderRuntimeState()
+            }
+        }.start()
+    }
+
+    private fun databaseStatus(index: ArcaeaChartIndex): String =
+        "${index.songCount} songs / ${index.chartCount} charts / ${index.knownConstantCount} CC"
+
     private fun renderRuntimeState() {
         if (TrackerRuntime.active) {
             statusText.text = liveRuntimeText()
@@ -192,7 +302,13 @@ class MainActivity : Activity() {
         statusText.text = if (saved != null) {
             persistedSnapshotText(saved)
         } else {
-            "No persisted tracking session yet.\n\nStart tracking to create diagnostics."
+            buildString {
+                appendLine("ARCAEA DATABASE")
+                appendLine("database         : $databaseStatus")
+                appendLine("results JSONL    : ${resultStore.sizeBytes()} bytes")
+                appendLine()
+                append("No persisted tracking session yet.\n\nStart tracking to create diagnostics.")
+            }
         }
     }
 
@@ -200,6 +316,7 @@ class MainActivity : Activity() {
         val sampleTime = formatTime(TrackerRuntime.lastSampleAtMs)
         return buildString {
             appendLine("LIVE SESSION")
+            appendLine("database         : $databaseStatus")
             appendLine("session          : ${TrackerRuntime.sessionId}")
             appendLine("tracking         : ${TrackerRuntime.active}")
             appendLine("capture mode     : ${TrackerRuntime.captureSize}")
@@ -220,6 +337,8 @@ class MainActivity : Activity() {
 
     private fun persistedSnapshotText(snapshot: DiagnosticSnapshot): String = buildString {
         appendLine("PERSISTED LAST SESSION")
+        appendLine("database         : $databaseStatus")
+        appendLine("results JSONL    : ${resultStore.sizeBytes()} bytes")
         appendLine("version          : ${snapshot.version}")
         appendLine("session          : ${snapshot.sessionId}")
         appendLine("started          : ${formatDateTime(snapshot.sessionStartedAtMs)}")
@@ -254,5 +373,7 @@ class MainActivity : Activity() {
         private const val REQUEST_CAPTURE = 4101
         private const val REQUEST_NOTIFICATIONS = 4102
         private const val REQUEST_EXPORT_DIAGNOSTICS = 4103
+        private const val REQUEST_IMPORT_DATABASE = 4104
+        private const val REQUEST_EXPORT_RESULTS = 4105
     }
 }
