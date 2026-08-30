@@ -32,17 +32,19 @@ class LightResultOcrGate(
 
         recognizer.process(image)
             .addOnSuccessListener(callbackExecutor) { text ->
-                callback(classify(text))
+                val result = classify(text)
+                VisionDebugState.update(result)
+                callback(result)
             }
             .addOnFailureListener(callbackExecutor) { error ->
-                callback(
-                    LightOcrResult(
-                        isResultLike = false,
-                        matchedKeywords = emptySet(),
-                        textPreview = "",
-                        error = error.message ?: error.javaClass.simpleName
-                    )
+                val result = LightOcrResult(
+                    isResultLike = false,
+                    matchedKeywords = emptySet(),
+                    textPreview = "",
+                    error = error.message ?: error.javaClass.simpleName
                 )
+                VisionDebugState.update(result)
+                callback(result)
             }
             .addOnCompleteListener(callbackExecutor) {
                 probe.recycle()
@@ -70,10 +72,10 @@ class LightResultOcrGate(
     }
 
     private fun createProbeBitmap(frame: Bitmap): Bitmap {
-        val left = (frame.width * ROI_LEFT).roundToInt().coerceIn(0, frame.width - 1)
-        val top = (frame.height * ROI_TOP).roundToInt().coerceIn(0, frame.height - 1)
-        val right = (frame.width * ROI_RIGHT).roundToInt().coerceIn(left + 1, frame.width)
-        val bottom = (frame.height * ROI_BOTTOM).roundToInt().coerceIn(top + 1, frame.height)
+        val left = (frame.width * OcrProbeRegion.LEFT).roundToInt().coerceIn(0, frame.width - 1)
+        val top = (frame.height * OcrProbeRegion.TOP).roundToInt().coerceIn(0, frame.height - 1)
+        val right = (frame.width * OcrProbeRegion.RIGHT).roundToInt().coerceIn(left + 1, frame.width)
+        val bottom = (frame.height * OcrProbeRegion.BOTTOM).roundToInt().coerceIn(top + 1, frame.height)
 
         val cropped = Bitmap.createBitmap(frame, left, top, right - left, bottom - top)
         val longest = max(cropped.width, cropped.height)
@@ -91,11 +93,6 @@ class LightResultOcrGate(
     }
 
     companion object {
-        // Still intentionally broad until the Arcaea screenshot corpus gives us measured ROIs.
-        private const val ROI_LEFT = 0.15f
-        private const val ROI_TOP = 0.08f
-        private const val ROI_RIGHT = 0.85f
-        private const val ROI_BOTTOM = 0.62f
         private const val OCR_LONG_EDGE_PX = 360
         private const val MAX_PREVIEW_CHARS = 160
     }
