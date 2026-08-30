@@ -57,9 +57,9 @@ class ArcaeaGameAdapter : GameAdapter {
     }
 
     /**
-     * Compare whatever follows TRACK with the beginning of the expected state. Requiring four
-     * readable characters keeps this much stricter than a generic fuzzy search while recovering
-     * the exact failure modes seen on the 480 px probe.
+     * Compare several prefixes after TRACK with the beginning of the expected state. Testing the
+     * short prefixes matters because region text is concatenated in the composite: TRACK CONP can
+     * otherwise become TRACKCONP09986622 and look much farther from COMPLETE than it really is.
      */
     private fun looksLikeTrackState(compactText: String, expectedState: String): Boolean {
         var searchFrom = 0
@@ -68,12 +68,14 @@ class ArcaeaGameAdapter : GameAdapter {
             if (trackAt < 0) return false
 
             val suffix = compactText.substring(trackAt + "TRACK".length)
-            val comparableLength = minOf(suffix.length, expectedState.length)
-            if (comparableLength >= MIN_FUZZY_STATE_CHARS) {
-                val observed = suffix.take(comparableLength)
-                val expected = expectedState.take(comparableLength)
-                val maxEdits = if (comparableLength >= 7) 2 else 1
-                if (levenshtein(observed, expected, maxEdits) <= maxEdits) return true
+            val maxComparable = minOf(suffix.length, expectedState.length)
+            if (maxComparable >= MIN_FUZZY_STATE_CHARS) {
+                for (length in MIN_FUZZY_STATE_CHARS..maxComparable) {
+                    val observed = suffix.take(length)
+                    val expected = expectedState.take(length)
+                    val maxEdits = if (length >= 7) 2 else 1
+                    if (levenshtein(observed, expected, maxEdits) <= maxEdits) return true
+                }
             }
 
             searchFrom = trackAt + 1
