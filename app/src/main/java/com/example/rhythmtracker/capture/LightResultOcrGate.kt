@@ -1,6 +1,8 @@
 package com.example.rhythmtracker.capture
 
 import android.graphics.Bitmap
+import com.example.rhythmtracker.game.GameAdapter
+import com.example.rhythmtracker.game.arcaea.ArcaeaGameAdapter
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
@@ -12,15 +14,11 @@ import kotlin.math.max
 import kotlin.math.roundToInt
 
 /**
- * Generic v0.2 OCR sentinel.
- *
- * This is deliberately NOT a universal rhythm-game result detector. It only proves the
- * low-cost pipeline: crop a small normalised region, run one bundled Latin OCR model, and
- * wake the expensive native-resolution capture only when result-like text is present.
- *
- * A real GameAdapter should replace the ROI and keyword rules for each game.
+ * Low-cost OCR sentinel. OCR mechanics live here; game-specific interpretation does not.
  */
-class LightResultOcrGate : Closeable {
+class LightResultOcrGate(
+    private val gameAdapter: GameAdapter = ArcaeaGameAdapter()
+) : Closeable {
 
     private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
 
@@ -61,18 +59,11 @@ class LightResultOcrGate : Closeable {
             .replace(Regex("\\s+"), " ")
             .trim()
 
-        val matched = RESULT_KEYWORDS
-            .filterTo(linkedSetOf()) { keyword -> normalised.contains(keyword) }
-
-        val hasTitleSignal = matched.any { it in TITLE_KEYWORDS }
-        val statSignals = matched.count { it in STAT_KEYWORDS }
-
-        // Generic plumbing rule only. Game adapters should use their own exact anchors.
-        val resultLike = (hasTitleSignal && statSignals >= 1) || statSignals >= 3
+        val decision = gameAdapter.classifyLightText(normalised)
 
         return LightOcrResult(
-            isResultLike = resultLike,
-            matchedKeywords = matched,
+            isResultLike = decision.isResultLike,
+            matchedKeywords = decision.matchedAnchors,
             textPreview = normalised.take(MAX_PREVIEW_CHARS),
             error = null
         )
@@ -100,32 +91,13 @@ class LightResultOcrGate : Closeable {
     }
 
     companion object {
-        // Generic centre/top sentinel. Game adapters will replace this with exact ROIs.
+        // Still intentionally broad until the Arcaea screenshot corpus gives us measured ROIs.
         private const val ROI_LEFT = 0.15f
         private const val ROI_TOP = 0.08f
         private const val ROI_RIGHT = 0.85f
         private const val ROI_BOTTOM = 0.62f
         private const val OCR_LONG_EDGE_PX = 360
-        private const val MAX_PREVIEW_CHARS = 120
-
-        private val TITLE_KEYWORDS = setOf(
-            "RESULT",
-            "RESULTS",
-            "COMPLETE",
-            "COMPLETED",
-            "CLEAR"
-        )
-
-        private val STAT_KEYWORDS = setOf(
-            "SCORE",
-            "RANK",
-            "COMBO",
-            "PERFECT",
-            "MISS",
-            "ACCURACY"
-        )
-
-        private val RESULT_KEYWORDS = TITLE_KEYWORDS + STAT_KEYWORDS
+        private const val MAX_PREVIEW_CHARS = 160
     }
 }
 
