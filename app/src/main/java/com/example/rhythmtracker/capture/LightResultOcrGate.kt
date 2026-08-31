@@ -18,15 +18,16 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 
 /**
- * Result OCR is deliberately split in two:
+ * Two-stage result OCR.
  *
- * LIGHT: copy the already-small MediaProjection probe frame and OCR the whole frame. We do not
- * assume that the Result label or any result field is at a fixed coordinate. A detected "Result"
- * word is the tripwire.
+ * LIGHT runs continuously on the reduced MediaProjection surface. `Result` is still the preferred
+ * tripwire, but a single tiny word is too fragile to be the only way into the result state. Strong
+ * result-only structure such as TRACK COMPLETE / TRACK LOST, two judgement labels, or MAX RECALL
+ * plus a score-shaped number can confirm the same screen when the tiny header is missed.
  *
- * NATIVE: after that tripwire fires, copy the full native frame and run the bundled Latin,
- * Chinese, Japanese and Korean recognisers on the original pixels. Semantic regions are then
- * derived from the text geometry returned by ML Kit instead of hard-coded rectangles.
+ * NATIVE runs once after LIGHT confirms a result. It keeps the full captured frame at its original
+ * resolution and combines the bundled Latin, Chinese, Japanese and Korean recognisers. Semantic
+ * regions are derived from detected geometry rather than fixed song-title rectangles.
  */
 class LightResultOcrGate : Closeable {
 
@@ -54,17 +55,7 @@ class LightResultOcrGate : Closeable {
         latinRecognizer.process(image)
             .addOnSuccessListener(callbackExecutor) { text ->
                 val lines = extractLines(text, working.width, working.height, "latin")
-                val tripwire = findResultTripwire(lines)
-                val result = LightOcrResult(
-                    isResultLike = tripwire != null,
-                    matchedKeywords = if (tripwire != null) setOf("RESULT") else emptySet(),
-                    textPreview = tripwire?.text.orEmpty(),
-                    regionReadings = tripwire?.let {
-                        listOf(it.toReading("result_tripwire", "RESULT TRIPWIRE"))
-                    }.orEmpty(),
-                    pass = OcrPass.LIGHT,
-                    error = null
-                )
+                val result = classifyLight(lines)
                 VisionDebugState.update(result)
                 callback(result)
             }
@@ -136,6 +127,23 @@ class LightResultOcrGate : Closeable {
         koreanRecognizer.close()
     }
 
+    private fun classifyLight(lines: List<DetectedLine>): LightOcrResult {
+        val signature = detectResultSignature(lines)
+        val preview = lines
+            .sortedWith(compareBy<DetectedLine> { it.bounds.top }.thenBy { it.bounds.left })
+            .joinToString(" | ") { it.text }
+            .take(LIGHT_PREVIEW_CHARS)
+
+        return LightOcrResult(
+            isResultLike = signature.resultLike,
+            matchedKeywords = signature.matched,
+            textPreview = preview,
+            regionReadings = signature.anchorReadings,
+            pass = OcrPass.LIGHT,
+            error = null
+        )
+    }
+
     private fun classifyNative(
         rawLines: List<DetectedLine>,
         width: Int,
@@ -143,20 +151,30 @@ class LightResultOcrGate : Closeable {
         errors: List<String>
     ): LightOcrResult {
         val lines = deduplicateLines(rawLines)
-        val tripwire = findResultTripwire(lines)
-        val readings = if (tripwire == null) {
-            emptyList()
+        val signature = detectResultSignature(lines)
+        val readings = if (signature.resultLike) {
+            buildDynamicReadings(
+                lines = lines,
+                tripwire = signature.resultTripwire,
+                track = signature.trackState,
+                width = width,
+                height = height
+            )
         } else {
-            buildDynamicReadings(lines, tripwire, width, height)
+            emptyList()
         }
 
-        val preview = readings
-            .joinToString(" | ") { "${it.label}: ${it.text}" }
-            .take(MAX_PREVIEW_CHARS)
+        val preview = if (readings.isNotEmpty()) {
+            readings.joinToString(" | ") { "${it.label}: ${it.text}" }.take(MAX_PREVIEW_CHARS)
+        } else {
+            lines.sortedWith(compareBy<DetectedLine> { it.bounds.top }.thenBy { it.bounds.left })
+                .joinToString(" | ") { it.text }
+                .take(MAX_PREVIEW_CHARS)
+        }
 
         return LightOcrResult(
-            isResultLike = tripwire != null,
-            matchedKeywords = if (tripwire != null) setOf("RESULT") else emptySet(),
+            isResultLike = signature.resultLike,
+            matchedKeywords = signature.matched,
             textPreview = preview,
             regionReadings = readings,
             pass = OcrPass.NATIVE,
@@ -164,58 +182,105 @@ class LightResultOcrGate : Closeable {
         )
     }
 
+    /**
+     * Prefer the tiny Result header, but do not make the whole tracker depend on one 10-20 px word.
+     * Every fallback below is result-screen-specific enough to be safe while gameplay is live.
+     */
+    private fun detectResultSignature(lines: List<DetectedLine>): ResultSignature {
+        val resultTripwire = findResultTripwire(lines)
+        val track = findTrackStateAnchor(lines)
+
+        val judgementLines = linkedMapOf<String, DetectedLine>()
+        JUDGEMENT_ANCHORS.forEach { token ->
+            lines.firstOrNull { containsAnchor(it.text, token) }?.let { judgementLines[token] = it }
+        }
+
+        val maxRecall = lines.firstOrNull { looksLikeMaxRecall(it.text) }
+        val score = lines
+            .filter { scoreDigitCount(it.text) in 7..8 }
+            .maxWithOrNull(compareBy<DetectedLine> { it.bounds.height() }.thenBy { it.bounds.width() })
+
+        val matched = linkedSetOf<String>()
+        if (resultTripwire != null) matched += "RESULT"
+        if (track != null) matched += trackStateLabel(track.text)
+        matched += judgementLines.keys
+        if (maxRecall != null) matched += "MAX RECALL"
+        if (score != null) matched += "SCORE_NUMBER"
+
+        val resultLike = resultTripwire != null ||
+            track != null ||
+            judgementLines.size >= 2 ||
+            (maxRecall != null && score != null)
+
+        val readings = mutableListOf<OcrRegionReading>()
+        resultTripwire?.toReading("result_tripwire", "RESULT TRIPWIRE")?.let(readings::add)
+        if (resultTripwire == null) {
+            track?.toReading("result_fallback", "RESULT FALLBACK")?.let(readings::add)
+                ?: judgementLines.values.firstOrNull()?.toReading(
+                    "result_fallback",
+                    "RESULT FALLBACK"
+                )?.let(readings::add)
+                ?: maxRecall?.toReading("result_fallback", "RESULT FALLBACK")?.let(readings::add)
+        }
+
+        return ResultSignature(
+            resultLike = resultLike,
+            matched = matched,
+            resultTripwire = resultTripwire,
+            trackState = track,
+            anchorReadings = readings
+        )
+    }
+
     private fun buildDynamicReadings(
         lines: List<DetectedLine>,
-        tripwire: DetectedLine,
+        tripwire: DetectedLine?,
+        track: DetectedLine?,
         width: Int,
         height: Int
     ): List<OcrRegionReading> {
         val result = mutableListOf<OcrRegionReading>()
-        result += tripwire.toReading("result_tripwire", "RESULT TRIPWIRE")
+        tripwire?.toReading("result_tripwire", "RESULT TRIPWIRE")?.let(result::add)
 
-        val track = lines
-            .filter { it.bounds.centerY() in (height * 0.14f).toInt()..(height * 0.62f).toInt() }
-            .filter { looksLikeTrackState(it.text) }
-            .maxByOrNull { it.bounds.height() * it.bounds.width() }
-
-        val titleTop = maxOf(tripwire.bounds.bottom + (height * 0.008f).toInt(), (height * 0.055f).toInt())
+        val titleTop = maxOf(
+            tripwire?.bounds?.bottom?.plus((height * 0.008f).toInt()) ?: (height * 0.055f).toInt(),
+            (height * 0.055f).toInt()
+        )
         val titleBottom = minOf(
-            track?.bounds?.top?.minus((height * 0.008f).toInt()) ?: (height * 0.31f).toInt(),
-            (height * 0.33f).toInt()
+            track?.bounds?.top?.minus((height * 0.008f).toInt()) ?: (height * 0.33f).toInt(),
+            (height * 0.35f).toInt()
         )
 
-        val titleLines = lines.filter { line ->
-            val cy = line.bounds.centerY()
-            val cx = line.bounds.centerX()
-            cy in titleTop..titleBottom &&
-                cx > width * 0.08f && cx < width * 0.92f &&
-                !isHeaderChrome(line.text) &&
-                !looksLikeTrackState(line.text)
+        if (titleBottom > titleTop) {
+            val titleLines = lines.filter { line ->
+                val cy = line.bounds.centerY()
+                val cx = line.bounds.centerX()
+                cy in titleTop..titleBottom &&
+                    cx > width * 0.06f && cx < width * 0.94f &&
+                    !isHeaderChrome(line.text) &&
+                    !looksLikeTrackState(line.text)
+            }
+            regionFromLines("title", "TITLE / ARTIST", titleLines, width, height, 0.012f)?.let(result::add)
         }
-        regionFromLines("title", "TITLE / ARTIST", titleLines, width, height, 0.012f)?.let(result::add)
 
         track?.toReading("track_state", "TRACK STATE")?.let(result::add)
 
         val score = lines
             .filter { line ->
                 val cy = line.bounds.centerY()
-                cy > height * 0.26f && cy < height * 0.67f && scoreDigitCount(line.text) in 7..8
+                cy > height * 0.24f && cy < height * 0.70f && scoreDigitCount(line.text) in 7..8
             }
-            .maxWithOrNull(
-                compareBy<DetectedLine> { it.bounds.height() }
-                    .thenBy { it.bounds.width() }
-            )
+            .maxWithOrNull(compareBy<DetectedLine> { it.bounds.height() }.thenBy { it.bounds.width() })
         score?.toReading("score", "SCORE")?.let(result::add)
 
         val judgementLabels = lines.filter { line ->
-            val upper = gateNormalize(line.text)
-            line.bounds.centerY() > height * 0.52f &&
-                ("PURE" in upper || "FAR" in upper || "LOST" in upper)
+            line.bounds.centerY() > height * 0.50f &&
+                JUDGEMENT_ANCHORS.any { containsAnchor(line.text, it) }
         }
         if (judgementLabels.isNotEmpty()) {
-            val tolerance = height * 0.04f
+            val tolerance = height * 0.045f
             val judgementLines = lines.filter { candidate ->
-                candidate.bounds.centerY() > height * 0.50f &&
+                candidate.bounds.centerY() > height * 0.48f &&
                     judgementLabels.any { label ->
                         abs(candidate.bounds.centerY() - label.bounds.centerY()) <= tolerance
                     }
@@ -301,6 +366,12 @@ class LightResultOcrGate : Closeable {
             .minWithOrNull(compareBy<DetectedLine> { it.bounds.top }.thenBy { it.bounds.left })
     }
 
+    private fun findTrackStateAnchor(lines: List<DetectedLine>): DetectedLine? {
+        return lines
+            .filter { looksLikeTrackState(it.text) }
+            .maxByOrNull { it.bounds.width() * it.bounds.height() }
+    }
+
     private fun looksLikeResultWord(raw: String): Boolean {
         val word = raw.uppercase(Locale.US).filter { it.isLetterOrDigit() }
         if (word == "RESULT") return true
@@ -309,9 +380,33 @@ class LightResultOcrGate : Closeable {
 
     private fun looksLikeTrackState(raw: String): Boolean {
         val compact = gateNormalize(raw).filter { it.isLetterOrDigit() }
-        if (!compact.contains("TRACK")) return false
-        return compact.contains("COMPLETE") || compact.contains("LOST") ||
-            compact.contains("COMPLE") || compact.contains("TRAKCOMP") || compact.contains("TRACKL0ST")
+        val hasTrack = compact.contains("TRACK") || compact.contains("TRAK") || compact.contains("TRAC")
+        if (!hasTrack) return false
+        return compact.contains("COMPLETE") || compact.contains("COMPLE") || compact.contains("COMPL") ||
+            compact.contains("COMP") || compact.contains("LOST") || compact.contains("L0ST")
+    }
+
+    private fun trackStateLabel(raw: String): String {
+        val compact = gateNormalize(raw).filter { it.isLetterOrDigit() }
+        return if (compact.contains("LOST") || compact.contains("L0ST")) "TRACK LOST" else "TRACK COMPLETE"
+    }
+
+    private fun looksLikeMaxRecall(raw: String): Boolean {
+        val compact = gateNormalize(raw).filter { it.isLetterOrDigit() }
+        if (compact.contains("MAXRECALL")) return true
+        return compact.length in 7..11 && levenshtein(compact.take(9), "MAXRECALL", 2) <= 2
+    }
+
+    private fun containsAnchor(raw: String, token: String): Boolean {
+        val upper = gateNormalize(raw)
+        if (token in upper) return true
+        val compact = upper.filter { it.isLetterOrDigit() }
+        return when (token) {
+            "PURE" -> compact.contains("PURE")
+            "FAR" -> compact.contains("FAR")
+            "LOST" -> compact.contains("LOST") || compact.contains("L0ST")
+            else -> false
+        }
     }
 
     private fun isHeaderChrome(raw: String): Boolean {
@@ -373,6 +468,14 @@ class LightResultOcrGate : Closeable {
         return previous[b.length]
     }
 
+    private data class ResultSignature(
+        val resultLike: Boolean,
+        val matched: Set<String>,
+        val resultTripwire: DetectedLine?,
+        val trackState: DetectedLine?,
+        val anchorReadings: List<OcrRegionReading>
+    )
+
     private data class DetectedLine(
         val text: String,
         val bounds: Rect,
@@ -393,8 +496,10 @@ class LightResultOcrGate : Closeable {
 
     companion object {
         private const val NATIVE_RECOGNIZER_COUNT = 4
+        private const val LIGHT_PREVIEW_CHARS = 320
         private const val MAX_PREVIEW_CHARS = 700
 
+        private val JUDGEMENT_ANCHORS = setOf("PURE", "FAR", "LOST")
         private val HEADER_CHROME = setOf(
             "RESULT", "SYNC", "POTENTIAL", "FRAGMENTS", "MEMORIES", "KEEP"
         )
