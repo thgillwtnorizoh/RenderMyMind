@@ -150,13 +150,16 @@ class ArcaeaResultParser(
     }
 
     private fun parseSmallNumber(raw: String): Int? {
-        val digits = raw.map { char ->
-            when (char) {
-                'O', 'o' -> '0'
-                'I', 'l', '|' -> '1'
-                else -> char
+        val digits = raw.asSequence()
+            .map { char ->
+                when (char) {
+                    'O', 'o' -> '0'
+                    'I', 'l', '|' -> '1'
+                    else -> char
+                }
             }
-        }.filter { it.isDigit() }
+            .filter { it.isDigit() }
+            .joinToString("")
         if (digits.isEmpty() || digits.length > 5) return null
         return digits.toIntOrNull()
     }
