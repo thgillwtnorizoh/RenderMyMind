@@ -1,6 +1,7 @@
 package com.example.rhythmtracker.parser
 
 import com.example.rhythmtracker.detection.ArcaeaResultDetector
+import com.example.rhythmtracker.game.arcaea.ArcaeaChartMarker
 import com.example.rhythmtracker.game.arcaea.ArcaeaResultLayout
 import com.example.rhythmtracker.vision.DebugRegion
 import com.example.rhythmtracker.vision.VisionLine
@@ -19,14 +20,42 @@ class ArcaeaResultParser(
         val pure: Int?,
         val far: Int?,
         val lost: Int?,
+        val displayedDifficulty: String?,
+        val displayedDifficultyLabel: String?,
+        val displayedLevel: String?,
+        val chartHiddenOnScreen: Boolean,
         val confidence: Float,
         val regions: List<DebugRegion>,
         val rawText: String
     )
 
+    private data class ChartMarkerParse(
+        val difficultyLine: VisionLine?,
+        val levelLine: VisionLine?,
+        val difficulty: String?,
+        val label: String?,
+        val level: String?,
+        val hiddenOnScreen: Boolean
+    )
+
     fun parse(lines: List<VisionLine>): Parsed {
         if (lines.isEmpty()) {
-            return Parsed(null, null, null, null, null, null, null, 0f, emptyList(), "")
+            return Parsed(
+                title = null,
+                artist = null,
+                trackState = null,
+                score = null,
+                pure = null,
+                far = null,
+                lost = null,
+                displayedDifficulty = null,
+                displayedDifficultyLabel = null,
+                displayedLevel = null,
+                chartHiddenOnScreen = false,
+                confidence = 0f,
+                regions = emptyList(),
+                rawText = ""
+            )
         }
 
         val trackLine = lines
@@ -36,6 +65,7 @@ class ArcaeaResultParser(
         val scoreLine = chooseScoreLine(lines)
         val titleLine = chooseTitleLine(lines, trackLine)
         val artistLine = chooseArtistLine(lines, titleLine, trackLine)
+        val chartMarker = chooseChartMarker(lines)
 
         val purePair = judgement(lines, "PURE")
         val farPair = judgement(lines, "FAR")
@@ -62,6 +92,12 @@ class ArcaeaResultParser(
             artistLine?.let { add(DebugRegion("artist", it.normalizedBounds, VisionStage.NATIVE)) }
             trackLine?.let { add(DebugRegion("track", it.normalizedBounds, VisionStage.NATIVE)) }
             scoreLine?.let { add(DebugRegion("score", it.normalizedBounds, VisionStage.NATIVE)) }
+            chartMarker.difficultyLine?.let {
+                add(DebugRegion("chart", it.normalizedBounds, VisionStage.NATIVE))
+            }
+            chartMarker.levelLine?.takeIf { it !== chartMarker.difficultyLine }?.let {
+                add(DebugRegion("level", it.normalizedBounds, VisionStage.NATIVE))
+            }
             purePair.first?.let { add(DebugRegion("pure", it.normalizedBounds, VisionStage.NATIVE)) }
             farPair.first?.let { add(DebugRegion("far", it.normalizedBounds, VisionStage.NATIVE)) }
             lostPair.first?.let { add(DebugRegion("lost", it.normalizedBounds, VisionStage.NATIVE)) }
@@ -79,9 +115,62 @@ class ArcaeaResultParser(
             pure = purePair.second,
             far = farPair.second,
             lost = lostPair.second,
+            displayedDifficulty = chartMarker.difficulty,
+            displayedDifficultyLabel = chartMarker.label,
+            displayedLevel = chartMarker.level,
+            chartHiddenOnScreen = chartMarker.hiddenOnScreen,
             confidence = confidence,
             regions = regions,
             rawText = rawText
+        )
+    }
+
+    private fun chooseChartMarker(lines: List<VisionLine>): ChartMarkerParse {
+        val candidates = lines.asSequence()
+            .filter(ArcaeaResultLayout::isChartBand)
+            .filterNot { isChrome(it.text) }
+            .filterNot { it.text.uppercase().contains("MAX RECALL") }
+            .toList()
+
+        val explicitLine = candidates.firstOrNull { ArcaeaChartMarker.parseDifficulty(it.text) != null }
+        val hiddenLine = candidates.firstOrNull(ArcaeaChartMarker::isHiddenDifficulty)
+        val difficultyLine = explicitLine ?: hiddenLine
+        val token = explicitLine?.let { ArcaeaChartMarker.parseDifficulty(it.text) }
+        val hidden = explicitLine == null && hiddenLine != null
+
+        val levelFromSameLine = difficultyLine?.let { ArcaeaChartMarker.parseLevel(it.text) }
+        val nearbyLevelLine = if (levelFromSameLine != null || difficultyLine == null) {
+            null
+        } else {
+            val verticalTolerance = difficultyLine.frameHeight * 0.06f
+            candidates.asSequence()
+                .filter { candidate ->
+                    candidate !== difficultyLine &&
+                        abs(candidate.bounds.centerY() - difficultyLine.bounds.centerY()) <= verticalTolerance &&
+                        candidate.bounds.centerX() <= difficultyLine.bounds.centerX() + difficultyLine.frameWidth * 0.06f
+                }
+                .mapNotNull { candidate ->
+                    ArcaeaChartMarker.parseLevel(candidate.text)?.let { level -> candidate to level }
+                }
+                .minByOrNull { (candidate, _) ->
+                    abs(candidate.bounds.centerX() - difficultyLine.bounds.left)
+                }
+        }
+
+        val level = levelFromSameLine ?: nearbyLevelLine?.second
+        val levelLine = if (levelFromSameLine != null) difficultyLine else nearbyLevelLine?.first
+
+        return ChartMarkerParse(
+            difficultyLine = difficultyLine,
+            levelLine = levelLine,
+            difficulty = token?.difficulty,
+            label = when {
+                token != null -> token.displayName
+                hidden -> "???"
+                else -> null
+            },
+            level = level,
+            hiddenOnScreen = hidden
         )
     }
 
