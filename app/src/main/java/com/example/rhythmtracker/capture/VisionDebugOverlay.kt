@@ -36,9 +36,7 @@ object VisionDebugState {
             resultLike = false,
             matchedAnchors = emptySet(),
             textPreview = "",
-            regionReadings = OcrProbeRegion.ALL.map {
-                OcrRegionReading(it.key, it.label, "")
-            },
+            regionReadings = emptyList(),
             pass = OcrPass.LIGHT,
             error = null
         )
@@ -49,11 +47,13 @@ object VisionDebugState {
 
         while (true) {
             val previous = latest.get()
-            // Once we have paid for a native-resolution OCR pass, keep those useful readings on
-            // screen for a few seconds. The next 480 px probe must not instantly overwrite them
-            // with the blurry text that caused this debugging feature in the first place.
+            // Keep the richer native geometry while the lightweight tripwire still confirms that
+            // the SAME result screen is live. A LIGHT miss is never suppressed: it must blank the
+            // overlay immediately when the player leaves the result screen.
             if (result.pass == OcrPass.LIGHT &&
+                result.isResultLike &&
                 previous.pass == OcrPass.NATIVE &&
+                previous.resultLike &&
                 now - previous.updatedAtMs < NATIVE_HOLD_MS
             ) {
                 return
@@ -75,13 +75,7 @@ object VisionDebugState {
     fun snapshot(): VisionDebugSnapshot = latest.get()
 }
 
-/**
- * Optional TYPE_APPLICATION_OVERLAY debugger.
- *
- * Every rectangle is a real OCR crop. The left-side panels show what ML Kit actually returned.
- * The overlay can be hidden for the brief native capture so its own borders/text do not pollute
- * the high-quality evidence frame.
- */
+/** Optional TYPE_APPLICATION_OVERLAY debugger. */
 object VisionDebugOverlay {
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -232,45 +226,38 @@ private class VisionDebugView(context: Context) : View(context) {
         super.onDraw(canvas)
         if (width <= 0 || height <= 0) return
 
-        drawGateStatus(canvas)
+        // Debug geometry is intentionally invisible during gameplay and menus. The tiny Result
+        // tripwire is the sole permission for boxes to exist on screen.
+        if (!snapshot.resultLike) return
 
-        val readings = snapshot.regionReadings.associateBy { it.key }
-        OcrProbeRegion.ALL.forEach { region ->
+        drawGateStatus(canvas)
+        snapshot.regionReadings.forEachIndexed { index, reading ->
             val roi = RectF(
-                width * region.left,
-                height * region.top,
-                width * region.right,
-                height * region.bottom
+                width * reading.left.coerceIn(0f, 1f),
+                height * reading.top.coerceIn(0f, 1f),
+                width * reading.right.coerceIn(0f, 1f),
+                height * reading.bottom.coerceIn(0f, 1f)
             )
-            val reading = readings[region.key]?.text.orEmpty()
+            if (roi.width() <= 1f || roi.height() <= 1f) return@forEachIndexed
 
             borderPaint.color = when {
                 snapshot.pass == OcrPass.NATIVE -> Color.rgb(179, 122, 255)
-                snapshot.resultLike -> Color.rgb(103, 230, 151)
-                reading.isNotBlank() -> Color.rgb(255, 200, 92)
-                else -> Color.rgb(103, 190, 255)
+                index == 0 -> Color.rgb(103, 230, 151)
+                else -> Color.rgb(255, 200, 92)
             }
             canvas.drawRect(roi, borderPaint)
-            drawRegionReadout(canvas, region, roi, reading)
+            drawRegionReadout(canvas, reading, roi)
         }
     }
 
     private fun drawGateStatus(canvas: Canvas) {
-        val state = when {
-            snapshot.error != null -> "OCR ERROR"
-            snapshot.resultLike -> "RESULT-LIKE"
-            snapshot.updatedAtMs == 0L -> "WAITING"
-            System.currentTimeMillis() - snapshot.updatedAtMs > STALE_AFTER_MS -> "STALE"
-            else -> "SCANNING"
-        }
-
-        val anchors = snapshot.matchedAnchors.joinToString(", ").ifBlank { "none" }
-        val text = "VISION ${snapshot.pass}: $state  |  anchors: $anchors"
+        val anchors = snapshot.matchedAnchors.joinToString(", ").ifBlank { "RESULT" }
+        val text = "VISION ${snapshot.pass}: RESULT LIVE  |  tripwire: $anchors"
         val padding = 6f * density
-        val maxWidth = width * 0.27f - padding * 2
+        val maxWidth = width * 0.32f - padding * 2
         val fitted = fitText(text, statusTextPaint, maxWidth)
         val h = statusTextPaint.fontMetrics.run { bottom - top } + padding * 2
-        val box = RectF(padding, padding, width * 0.27f, padding + h)
+        val box = RectF(padding, padding, width * 0.32f, padding + h)
         canvas.drawRoundRect(box, 5f * density, 5f * density, labelBackgroundPaint)
         val baseline = box.top + padding - statusTextPaint.fontMetrics.top
         canvas.drawText(fitted, box.left + padding, baseline, statusTextPaint)
@@ -278,29 +265,31 @@ private class VisionDebugView(context: Context) : View(context) {
 
     private fun drawRegionReadout(
         canvas: Canvas,
-        region: OcrProbeRegionSpec,
-        roi: RectF,
-        reading: String
+        reading: OcrRegionReading,
+        roi: RectF
     ) {
         val outerPadding = 6f * density
         val innerPadding = 5f * density
-        val left = outerPadding
-        val right = (roi.left - outerPadding).coerceAtLeast(left + 40f * density)
         val lineHeight = labelTextPaint.fontMetrics.run { bottom - top }
         val boxHeight = lineHeight * 2 + innerPadding * 2
-        val preferredTop = roi.top
-        val top = preferredTop.coerceIn(
+
+        // Prefer the left of the detected geometry. If there is no room, pin the readout inside
+        // the screen instead of letting a dynamic title rectangle push it off-canvas.
+        val maxPanelWidth = width * 0.36f
+        val preferredRight = roi.left - outerPadding
+        val panelWidth = minOf(maxPanelWidth, preferredRight - outerPadding).coerceAtLeast(80f * density)
+        val left = outerPadding
+        val right = (left + panelWidth).coerceAtMost(width - outerPadding)
+        val top = roi.top.coerceIn(
             outerPadding,
             (height - boxHeight - outerPadding).coerceAtLeast(outerPadding)
         )
         val box = RectF(left, top, right, top + boxHeight)
         canvas.drawRoundRect(box, 5f * density, 5f * density, labelBackgroundPaint)
 
-        val label = "${region.label}:"
-        val value = if (reading.isBlank()) "(no text)" else reading
         val maxTextWidth = (box.width() - innerPadding * 2).coerceAtLeast(1f)
-        val line1 = fitText(label, labelTextPaint, maxTextWidth)
-        val line2 = fitText(value, labelTextPaint, maxTextWidth)
+        val line1 = fitText("${reading.label}:", labelTextPaint, maxTextWidth)
+        val line2 = fitText(reading.text.ifBlank { "(no text)" }, labelTextPaint, maxTextWidth)
         val firstBaseline = box.top + innerPadding - labelTextPaint.fontMetrics.top
         val secondBaseline = firstBaseline + lineHeight
         canvas.drawText(line1, box.left + innerPadding, firstBaseline, labelTextPaint)
@@ -314,9 +303,5 @@ private class VisionDebugView(context: Context) : View(context) {
         val available = (maxWidth - paint.measureText("…")).coerceAtLeast(0f)
         val count = paint.breakText(text, true, available, null).coerceAtLeast(0)
         return text.take(count).trimEnd() + "…"
-    }
-
-    companion object {
-        private const val STALE_AFTER_MS = 2_500L
     }
 }
