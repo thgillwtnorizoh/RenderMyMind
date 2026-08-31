@@ -10,8 +10,8 @@ android {
         applicationId = "com.example.rhythmtracker"
         minSdk = 29
         targetSdk = 36
-        versionCode = 7
-        versionName = "0.3.3-alpha"
+        versionCode = 8
+        versionName = "0.3.4-alpha"
     }
 
     compileOptions {
@@ -27,6 +27,9 @@ android {
 }
 
 dependencies {
-    // Bundled Latin model: available immediately, no first-run model download during a session.
+    // Bundled models keep result OCR available offline and avoid first-run downloads.
     implementation("com.google.mlkit:text-recognition:16.0.1")
+    implementation("com.google.mlkit:text-recognition-chinese:16.0.1")
+    implementation("com.google.mlkit:text-recognition-japanese:16.0.1")
+    implementation("com.google.mlkit:text-recognition-korean:16.0.1")
 }
