@@ -133,7 +133,7 @@ class ArcaeaResultParser(
             .toList()
 
         val explicitLine = candidates.firstOrNull { ArcaeaChartMarker.parseDifficulty(it.text) != null }
-        val hiddenLine = candidates.firstOrNull(ArcaeaChartMarker::isHiddenDifficulty)
+        val hiddenLine = candidates.firstOrNull { ArcaeaChartMarker.isHiddenDifficulty(it.text) }
         val difficultyLine = explicitLine ?: hiddenLine
         val token = explicitLine?.let { ArcaeaChartMarker.parseDifficulty(it.text) }
         val hidden = explicitLine == null && hiddenLine != null
