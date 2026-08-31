@@ -1,74 +1,101 @@
-# RenderMyMind Alpha v0.2
+# RenderMyMind Alpha
 
-Android rhythm-game result tracking prototype focused on staying out of the game's way.
+Android Arcaea result-screen tracking prototype with an offline screenshot inspector and a database-backed chart resolver.
 
-v0.2 replaces the old once-per-second Surface attach/detach pulse with a persistent low-resolution projection surface and a lightweight OCR sentinel.
+Current alpha: **0.5.0-alpha**.
 
-## v0.2 pipeline
+## Current architecture
 
-```text
-MediaProjection session
-    ↓
-one VirtualDisplay for the entire session
-    ↓
-persistent 480 px long-edge ImageReader surface
-    ↓
-every ~900 ms: pull newest queued frame
-    ↓
-crop one small normalised OCR region
-    ↓
-bundled ML Kit Latin text recogniser
-    ↓
-result-like text?
-    ├─ no  → sleep until next probe
-    └─ yes → switch SAME VirtualDisplay to native resolution
-              ↓
-            discard first post-resize frame
-              ↓
-            capture second frame
-              ↓
-            save PNG evidence
-              ↓
-            resize SAME VirtualDisplay back to low-res probe
-```
-
-The expensive native-resolution transition happens only after the light OCR gate believes the result screen is present, when gameplay should already be over.
-
-## Important limitation
-
-The current OCR sentinel is intentionally generic. It looks at a central/top region and checks result-ish words such as `RESULT`, `COMPLETE`, `SCORE`, `RANK`, `COMBO`, `PERFECT`, `MISS`, and `ACCURACY`.
-
-It is a plumbing/performance prototype, not a universal detector. The real implementation should give every game adapter its own normalised ROI, anchors, keywords and recognition rules.
-
-A generic OCR hit captures evidence only. It does **not** create an automatic score record yet.
-
-## Result-screen evidence
-
-Native result frames are saved to private app storage:
+The project intentionally keeps capture, OCR, detection, parsing, chart identity, persistence, and debug rendering separate.
 
 ```text
-/data/user/0/com.example.rhythmtracker/files/result-captures/result_<timestamp>.png
+MediaProjection / imported screenshot
+        ↓
+ML Kit OCR
+        ↓
+Arcaea result detector
+        ↓
+full-resolution result parser
+        ↓
+semantic chart resolver
+        ↓
+result storage / inspector output
 ```
 
-For the debug build, copy the newest evidence directory with ADB/run-as or inspect the path shown in the app telemetry.
+The offline **Inspect result images** mode is the primary calibration bench for the current phase. It runs the same native OCR and parser as live tracking without MediaProjection timing/state noise.
 
-The existing manual test button still appends `results.jsonl` in `context.filesDir`.
+## Native OCR
 
-## Why the capture architecture changed
+Authoritative result parsing operates on the original captured image resolution. Preview images may be scaled for display, but the OCR input is not downscaled.
 
-v0.1 repeatedly attached and detached the ImageReader Surface for every detector sample. During real rhythm-game testing that design was suspected of contributing to fixed-interval frame hitches.
+Bundled recognizers:
 
-v0.2 keeps the low-resolution Surface attached. App code does not register a display-FPS image listener. Instead, it explicitly pulls the newest queued frame on the probe cadence, so we avoid both Surface churn and a Java/Kotlin callback storm at 60/90/120 Hz.
+- Latin
+- Chinese
+- Japanese
+- Korean
 
-## OCR model
+## Arcaea database schema v2
 
-v0.2 uses the bundled Latin ML Kit text-recognition model:
+The database layer was rewritten for 0.5.0-alpha.
+
+Semantic chart names remain the stable keys:
 
 ```text
-com.google.mlkit:text-recognition:16.0.1
+PST / PRS / FTR / BYD / ETR / INS
 ```
 
-Bundling makes the sentinel available immediately after installation rather than relying on a first-run model download during a test session.
+Raw songlist classification is stored inside each chart instead of replacing those semantic keys with numbers.
+
+The important special case is:
+
+```text
+BYD -> ratingClass 3, bydType 0
+INS -> ratingClass 3, ratingClassAlias 1, bydType 1
+```
+
+This preserves the fact that Beyond and Inscribed share the same base `ratingClass` while remaining different semantic chart types.
+
+See [`docs/ARCAEA_DATABASE_V2.md`](docs/ARCAEA_DATABASE_V2.md) for the schema and migration rules.
+
+### Database tool
+
+Migrate the old merged database:
+
+```bash
+python tools/arcaea_db.py migrate cheeseburger-merged.json arcaea-database-v2.json
+```
+
+Preferred migration with official songlist source classification:
+
+```bash
+python tools/arcaea_db.py migrate \
+  cheeseburger-merged.json \
+  arcaea-database-v2.json \
+  --songlist songlist.json
+```
+
+Validate or inspect stats:
+
+```bash
+python tools/arcaea_db.py validate arcaea-database-v2.json
+python tools/arcaea_db.py stats arcaea-database-v2.json
+```
+
+The Android app still accepts the previous `arcaea_wiki_entries` format during migration and derives classification from existing semantic chart keys. New imports are stored as `arcaea-database.json`; an existing private `cheeseburger-merged.json` remains readable until replaced.
+
+## Hidden result-screen chart markers
+
+`? / ???` is treated as an intentional result-screen state, not OCR failure.
+
+Resolution is conservative:
+
+1. use visible `PAST/PRESENT/FUTURE/BEYOND/ETERNAL/INSCRIBED` when present;
+2. for a hidden marker, prefer a single database chart explicitly marked hidden-until-unlock;
+3. otherwise a single Inscribed classification (`ratingClass=3`, `bydType=1`) may resolve the hidden chart;
+4. otherwise leave the chart unresolved rather than guessing.
+
+The screenshot inspector displays the resolution basis and the underlying database classification so these decisions are visible during testing.
 
 ## Build baseline
 
@@ -77,54 +104,23 @@ Bundling makes the sentinel available immediately after installation rather than
 - JDK: 17+
 - compileSdk / targetSdk: 36
 - minSdk: 29
-- package/application ID: `com.example.rhythmtracker` (unchanged for now)
+- package/application ID: `com.example.rhythmtracker`
 - visible app name: **RenderMyMind Alpha**
 
-CI intentionally targets Android API 36. Do not bump the GitHub Actions build to API 37 unless the hosted Android SDK channel actually provides it; an earlier API 37 CI attempt failed because that platform package was unavailable.
+CI deliberately uses Android API 36. A previous API 37 hosted-SDK attempt failed because the platform package was unavailable.
 
-The repository contains `gradle/wrapper/gradle-wrapper.properties` but not the wrapper JAR. On Windows, `bootstrap-wrapper.cmd` can download Gradle 9.5.0 and generate the wrapper.
+CI runs both database-tool Python tests and Android/Kotlin unit tests before building APKs.
 
-## Run
+## Testing focus
 
-1. Install/open **RenderMyMind Alpha**.
-2. Tap **Start tracking**.
-3. Allow notification permission if prompted.
-4. Allow Android screen capture.
-5. Launch the rhythm game and play normally.
-6. After the session, return to RenderMyMind and inspect:
-   - frames pulled
-   - OCR probes
-   - OCR result hits
-   - screens captured
-   - last OCR text
-   - last PNG path
-7. Stop from the app or persistent notification.
+For the current phase, prefer **Inspect result images** over live MediaProjection testing. Useful test coverage includes:
 
-Android 14+ still requires explicit MediaProjection consent for each capture session.
+- different device resolutions and aspect ratios
+- normal difficulty labels and levels
+- hidden `? / ???` charts
+- Inscribed result screens
+- long/multilingual song titles
+- `TRACK COMPLETE`, `TRACK LOST`, and other result states
+- score and PURE/FAR/LOST extraction
 
-## v0.2 performance test
-
-The most important comparison is v0.1-style behaviour versus this persistent-surface design:
-
-- does the old fixed-interval hitch disappear or become smaller?
-- any new hitch at the ~900 ms OCR cadence?
-- touch latency/audio behaviour
-- FPS/jank with tracking OFF vs ON
-- temperature and battery delta
-- orientation changes
-- lock/unlock
-- projection revocation by another recorder
-- whether OCR probing stalls during a long session
-
-A one-time hitch after the song ends, when native capture wakes, is much less concerning than a repeating hitch during gameplay.
-
-## Key files
-
-- `capture/CaptureService.kt` - persistent probe, OCR cadence, native result burst and MediaProjection lifecycle
-- `capture/LightResultOcrGate.kt` - generic tiny-ROI OCR sentinel
-- `data/ResultCaptureStore.kt` - native result PNG evidence
-- `data/PlayResult.kt` - score-domain skeleton
-- `data/FileResultStore.kt` - append-only `results.jsonl` placeholder
-- `TrackerRuntime.kt` - live prototype telemetry
-
-See `NEXT_STEP.md` for the first game-specific adapter plan.
+Once offline parsing is stable, live tracking can be reconnected and evaluated separately for state/lifecycle behaviour.
