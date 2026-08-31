@@ -13,6 +13,10 @@
         android:theme="@style/Theme.RhythmTracker">
 
         <activity
+            android:name=".inspection.ResultInspectionActivity"
+            android:exported="false" />
+
+        <activity
             android:name=".MainActivity"
             android:exported="true">
             <intent-filter>
