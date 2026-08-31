@@ -8,12 +8,6 @@ import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.content.res.Configuration
-import android.graphics.Bitmap
-import android.graphics.PixelFormat
-import android.hardware.display.DisplayManager
-import android.hardware.display.VirtualDisplay
-import android.media.Image
-import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
@@ -26,64 +20,63 @@ import com.example.rhythmtracker.MainActivity
 import com.example.rhythmtracker.R
 import com.example.rhythmtracker.TrackerRuntime
 import com.example.rhythmtracker.data.DiagnosticStore
+import com.example.rhythmtracker.data.FileResultStore
+import com.example.rhythmtracker.data.PlayResult
 import com.example.rhythmtracker.data.ResultCaptureStore
+import com.example.rhythmtracker.debug.DebugBus
+import com.example.rhythmtracker.debug.DebugSnapshot
+import com.example.rhythmtracker.detection.ArcaeaResultDetector
+import com.example.rhythmtracker.game.arcaea.ArcaeaChartIndex
+import com.example.rhythmtracker.game.arcaea.ArcaeaDatabaseStore
+import com.example.rhythmtracker.identity.ResultIdentity
+import com.example.rhythmtracker.identity.VisualFingerprint
+import com.example.rhythmtracker.parser.ArcaeaResultParser
+import com.example.rhythmtracker.state.ResultStateMachine
+import com.example.rhythmtracker.vision.MlKitOcrEngine
+import com.example.rhythmtracker.vision.VisionStage
 import org.json.JSONObject
 import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.math.max
-import kotlin.math.roundToInt
 
+/**
+ * V2 orchestration service.
+ *
+ * MediaProjection, OCR, detection, identity, state, parsing, debug and persistence are separate
+ * components. This service only moves data between them and owns Android lifecycle/foreground work.
+ */
 class CaptureService : Service() {
-
     private lateinit var captureThread: HandlerThread
     private lateinit var captureHandler: Handler
+    private lateinit var frameSource: ProjectionFrameSource
     private lateinit var captureStore: ResultCaptureStore
+    private lateinit var resultStore: FileResultStore
     private lateinit var diagnosticStore: DiagnosticStore
 
     private val analysisExecutor = Executors.newSingleThreadExecutor()
-    private val diagnosticExecutor = Executors.newSingleThreadExecutor()
-    private val ocrGate = LightResultOcrGate()
+    private val ioExecutor = Executors.newSingleThreadExecutor()
+    private val ocrEngine = MlKitOcrEngine()
+    private val detector = ArcaeaResultDetector()
+    private val parser = ArcaeaResultParser(detector)
+    private val stateMachine = ResultStateMachine()
 
     private var mediaProjection: MediaProjection? = null
-    private var virtualDisplay: VirtualDisplay? = null
-    private var probeReader: ImageReader? = null
-    private var burstReader: ImageReader? = null
-
-    private var sourceWidth = 0
-    private var sourceHeight = 0
-    private var probeWidth = 0
-    private var probeHeight = 0
-    private var densityDpi = 0
-
+    private var chartIndex: ArcaeaChartIndex? = null
     private var probeInFlight = false
     private var probeStartedAtNs = 0L
-    private var burstInProgress = false
-    private var burstFramesSeen = 0
-    private var resultArmed = true
-    private var consecutiveMisses = 0
     private var ownsSession = false
-    private var lastSlowOcrLoggedAtMs = 0L
-
+    private var captureGeneration = 0L
+    private var latestCaptureGeneration = 0L
     private val shuttingDown = AtomicBoolean(false)
 
-    private val probeRunnable = Runnable { pullProbeFrame() }
+    private val probeRunnable = Runnable { pullProbe() }
 
     private val diagnosticRunnable = object : Runnable {
         override fun run() {
             if (!TrackerRuntime.active || shuttingDown.get() || !ownsSession) return
             queueDiagnosticsSnapshot()
-            captureHandler.postDelayed(this, DIAGNOSTIC_SNAPSHOT_INTERVAL_MS)
+            captureHandler.postDelayed(this, DIAGNOSTIC_INTERVAL_MS)
         }
-    }
-
-    private val burstTimeoutRunnable = Runnable {
-        if (!burstInProgress || shuttingDown.get()) return@Runnable
-        queueDiagnosticsSnapshot(
-            event = "native_capture_timeout",
-            extra = JSONObject().put("framesSeen", burstFramesSeen)
-        )
-        restoreProbeSurface("Native result capture timed out; returned to OCR probe")
     }
 
     private val projectionCallback = object : MediaProjection.Callback() {
@@ -94,41 +87,46 @@ class CaptureService : Service() {
         }
 
         override fun onCapturedContentResize(width: Int, height: Int) {
-            handleSourceResize(width, height)
+            captureHandler.post {
+                if (!shuttingDown.get()) {
+                    frameSource.updateSourceSize(width, height)
+                    TrackerRuntime.captureSize = frameSource.probeSizeLabel()
+                    queueDiagnosticsSnapshot(
+                        event = "source_resized",
+                        extra = JSONObject().put("width", width).put("height", height)
+                    )
+                }
+            }
         }
     }
 
     override fun onCreate() {
         super.onCreate()
-        captureThread = HandlerThread("rendermymind-capture")
+        captureThread = HandlerThread("rendermymind-v2-capture")
         captureThread.start()
         captureHandler = Handler(captureThread.looper)
+        frameSource = ProjectionFrameSource(captureHandler)
         captureStore = ResultCaptureStore(this)
+        resultStore = FileResultStore(this)
         diagnosticStore = DiagnosticStore(this)
+        chartIndex = runCatching { ArcaeaDatabaseStore(this).load() }.getOrNull()
         createNotificationChannel()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> {
-                if (TrackerRuntime.active) return START_NOT_STICKY
-
-                startForeground(
-                    NOTIFICATION_ID,
-                    buildNotification(),
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-                )
-                startProjectionFromIntent(intent)
+                if (!TrackerRuntime.active) {
+                    startForeground(
+                        NOTIFICATION_ID,
+                        buildNotification(),
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                    )
+                    startProjection(intent)
+                }
             }
-
-            ACTION_STOP -> {
-                TrackerRuntime.lastMessage = "Stopping tracking…"
-                stopSelf()
-            }
-
-            ACTION_FLUSH_DIAGNOSTICS -> {
-                if (ownsSession) saveDiagnosticsNow("manual_flush", appendEvent = true)
-            }
+            ACTION_STOP -> stopSelf()
+            ACTION_FLUSH_DIAGNOSTICS -> if (ownsSession) saveDiagnosticsNow("manual_flush")
         }
         return START_NOT_STICKY
     }
@@ -138,24 +136,22 @@ class CaptureService : Service() {
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         if (Build.VERSION.SDK_INT < 34 && TrackerRuntime.active) {
-            captureHandler.post {
-                val (width, height) = currentDisplayBounds()
-                handleSourceResize(width, height)
-            }
+            val (width, height) = currentDisplayBounds()
+            captureHandler.post { frameSource.updateSourceSize(width, height) }
         }
     }
 
     override fun onDestroy() {
         shutdownProjection(requestProjectionStop = true)
-        ocrGate.close()
+        ocrEngine.close()
         analysisExecutor.shutdownNow()
-        diagnosticExecutor.shutdownNow()
+        ioExecutor.shutdownNow()
         if (::captureThread.isInitialized) captureThread.quitSafely()
         stopForeground(STOP_FOREGROUND_REMOVE)
         super.onDestroy()
     }
 
-    private fun startProjectionFromIntent(intent: Intent) {
+    private fun startProjection(intent: Intent) {
         val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Int.MIN_VALUE)
         val resultData = if (Build.VERSION.SDK_INT >= 33) {
             intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
@@ -170,8 +166,8 @@ class CaptureService : Service() {
             return
         }
 
-        val projectionManager = getSystemService(MediaProjectionManager::class.java)
-        val projection = projectionManager.getMediaProjection(resultCode, resultData)
+        val manager = getSystemService(MediaProjectionManager::class.java)
+        val projection = manager.getMediaProjection(resultCode, resultData)
         if (projection == null) {
             TrackerRuntime.lastMessage = "Android returned no MediaProjection instance"
             stopSelf()
@@ -180,33 +176,17 @@ class CaptureService : Service() {
 
         mediaProjection = projection
         projection.registerCallback(projectionCallback, captureHandler)
-
-        densityDpi = resources.configuration.densityDpi
         val (width, height) = currentDisplayBounds()
-        sourceWidth = width
-        sourceHeight = height
 
-        createProbeReader(width, height)
-        val reader = probeReader
-        if (reader == null) {
-            TrackerRuntime.lastMessage = "Could not create OCR probe ImageReader"
-            stopSelf()
-            return
-        }
-
-        virtualDisplay = projection.createVirtualDisplay(
-            "RenderMyMindProbe",
-            probeWidth,
-            probeHeight,
-            densityDpi,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            reader.surface,
-            null,
-            captureHandler
-        )
-
-        if (virtualDisplay == null) {
-            TrackerRuntime.lastMessage = "createVirtualDisplay() returned null"
+        runCatching {
+            frameSource.start(
+                mediaProjection = projection,
+                width = width,
+                height = height,
+                dpi = resources.configuration.densityDpi
+            )
+        }.onFailure { error ->
+            TrackerRuntime.lastMessage = "Projection setup failed: ${error.message ?: error.javaClass.simpleName}"
             stopSelf()
             return
         }
@@ -214,334 +194,252 @@ class CaptureService : Service() {
         shuttingDown.set(false)
         probeInFlight = false
         probeStartedAtNs = 0L
-        burstInProgress = false
-        resultArmed = true
-        consecutiveMisses = 0
-        lastSlowOcrLoggedAtMs = 0L
+        captureGeneration = 0L
+        latestCaptureGeneration = 0L
+        stateMachine.reset()
+        DebugBus.clear()
 
-        val startedAtMs = System.currentTimeMillis()
-        TrackerRuntime.resetForNewSession(
-            id = UUID.randomUUID().toString(),
-            startedAtMs = startedAtMs
-        )
-        ownsSession = true
+        val now = System.currentTimeMillis()
+        TrackerRuntime.resetForNewSession(UUID.randomUUID().toString(), now)
         TrackerRuntime.active = true
-        TrackerRuntime.captureSize = "${probeWidth}x${probeHeight} persistent OCR probe"
-        TrackerRuntime.lastMessage =
-            "v0.2.1 active; persistent low-res surface + light OCR every ${PROBE_INTERVAL_MS}ms"
+        TrackerRuntime.captureSize = frameSource.probeSizeLabel()
+        TrackerRuntime.lastMessage = "v2 pipeline active"
+        ownsSession = true
 
-        saveDiagnosticsNow("session_start", appendEvent = true)
+        saveDiagnosticsNow("session_start")
         captureHandler.removeCallbacks(diagnosticRunnable)
-        captureHandler.postDelayed(diagnosticRunnable, DIAGNOSTIC_SNAPSHOT_INTERVAL_MS)
-        scheduleNextProbe(250L)
+        captureHandler.postDelayed(diagnosticRunnable, DIAGNOSTIC_INTERVAL_MS)
+        scheduleProbe(250L)
     }
 
-    /**
-     * Pulls the newest queued low-resolution frame without changing the VirtualDisplay surface.
-     * The surface stays attached for the entire gameplay session.
-     */
-    private fun pullProbeFrame() {
-        if (!TrackerRuntime.active || shuttingDown.get() || burstInProgress || probeInFlight) return
-        val reader = probeReader ?: return
-
-        val image = runCatching { reader.acquireLatestImage() }.getOrNull()
-        if (image == null) {
-            scheduleNextProbe(PROBE_EMPTY_RETRY_MS)
+    private fun pullProbe() {
+        if (!TrackerRuntime.active || shuttingDown.get() || probeInFlight || frameSource.isNativeCaptureActive()) {
             return
         }
 
-        val bitmap = try {
-            imageToBitmap(image)
-        } finally {
-            image.close()
+        val bitmap = frameSource.acquireLatestProbe()
+        if (bitmap == null) {
+            scheduleProbe(PROBE_EMPTY_RETRY_MS)
+            return
         }
 
+        val fingerprint = VisualFingerprint.from(bitmap)
         TrackerRuntime.sampledFrames += 1
         TrackerRuntime.ocrProbes += 1
         TrackerRuntime.lastSampleAtMs = System.currentTimeMillis()
         probeInFlight = true
         probeStartedAtNs = SystemClock.elapsedRealtimeNanos()
 
-        try {
-            // inspect() immediately copies only the small OCR ROI, so the full probe bitmap can
-            // be recycled as soon as the asynchronous ML Kit task has been queued.
-            ocrGate.inspect(bitmap, analysisExecutor) { result ->
-                captureHandler.post {
-                    handleOcrResult(result)
-                }
-            }
-        } catch (error: Throwable) {
+        ocrEngine.recognizeLight(bitmap, analysisExecutor) { result ->
+            bitmap.recycle()
+            captureHandler.post { handleLightOcr(result, fingerprint) }
+        }
+    }
+
+    private fun handleLightOcr(result: Result<List<com.example.rhythmtracker.vision.VisionLine>>, fingerprint: Long) {
+        if (shuttingDown.get()) return
+        probeInFlight = false
+        recordOcrDuration()
+
+        result.onFailure { error ->
+            TrackerRuntime.lastMessage = "Light OCR failed: ${error.message ?: error.javaClass.simpleName}"
+            queueDiagnosticsSnapshot(
+                event = "light_ocr_error",
+                extra = JSONObject().put("message", TrackerRuntime.lastMessage)
+            )
+            scheduleProbe(stateMachine.recommendedProbeDelayMs())
+            return
+        }
+
+        val lines = result.getOrThrow()
+        val detection = detector.detect(lines, fingerprint)
+        TrackerRuntime.lastOcrText = detection.preview.ifBlank { "-" }
+        if (detection.signal.present) TrackerRuntime.ocrHits += 1
+
+        val update = stateMachine.observe(detection.signal)
+        DebugBus.publish(
+            DebugSnapshot(
+                visible = update.resultVisible,
+                stage = VisionStage.LIGHT,
+                stateLabel = update.stateLabel,
+                regions = if (update.resultVisible) detection.regions else emptyList()
+            )
+        )
+
+        if (update.captureRequested) {
+            val words = detection.signal.anchors.joinToString(", ")
+            TrackerRuntime.lastMessage = "Accepted distinct result [$words]; native capture"
+            queueDiagnosticsSnapshot(
+                event = "result_accepted",
+                extra = JSONObject()
+                    .put("anchors", words)
+                    .put("state", update.stateLabel)
+                    .put("strength", detection.signal.strength.toDouble())
+            )
+            beginNativeCapture(update.acceptedIdentity)
+            return
+        }
+
+        TrackerRuntime.lastMessage = when {
+            detection.signal.present -> "Result present; state=${update.stateLabel}"
+            update.resultVisible -> "Holding live result through transient OCR miss"
+            else -> "No result screen"
+        }
+        scheduleProbe(stateMachine.recommendedProbeDelayMs())
+    }
+
+    private fun beginNativeCapture(identity: ResultIdentity?) {
+        captureGeneration += 1
+        val generation = captureGeneration
+        latestCaptureGeneration = generation
+        TrackerRuntime.captureSize = frameSource.nativeSizeLabel()
+
+        val started = frameSource.captureNative { frameResult ->
             captureHandler.post {
-                probeInFlight = false
-                probeStartedAtNs = 0L
-                TrackerRuntime.lastMessage =
-                    "OCR probe setup failed: ${error.message ?: error.javaClass.simpleName}"
-                queueDiagnosticsSnapshot(
-                    event = "ocr_setup_error",
-                    extra = JSONObject().put("message", TrackerRuntime.lastMessage)
-                )
-                scheduleNextProbe(PROBE_INTERVAL_MS)
+                TrackerRuntime.captureSize = frameSource.probeSizeLabel()
+                frameResult.onSuccess { bitmap ->
+                    handleNativeFrame(bitmap, generation, identity)
+                }.onFailure { error ->
+                    TrackerRuntime.lastMessage = "Native capture failed: ${error.message ?: error.javaClass.simpleName}"
+                    queueDiagnosticsSnapshot(
+                        event = "native_capture_error",
+                        extra = JSONObject().put("message", TrackerRuntime.lastMessage)
+                    )
+                }
+                scheduleProbe(220L)
             }
-        } finally {
+        }
+
+        if (!started) {
+            TrackerRuntime.captureSize = frameSource.probeSizeLabel()
+            TrackerRuntime.lastMessage = "Native capture request rejected because source was busy"
+            scheduleProbe(stateMachine.recommendedProbeDelayMs())
+        }
+    }
+
+    private fun handleNativeFrame(bitmap: android.graphics.Bitmap, generation: Long, identity: ResultIdentity?) {
+        val capturedAtMs = System.currentTimeMillis()
+        TrackerRuntime.capturedScreens += 1
+
+        ioExecutor.execute {
+            val fileResult = runCatching { captureStore.save(bitmap, capturedAtMs) }
+            fileResult.onSuccess { file ->
+                TrackerRuntime.lastCapturePath = file.absolutePath
+                queueDiagnosticsSnapshot(
+                    event = "native_capture_saved",
+                    extra = JSONObject().put("file", file.name).put("generation", generation)
+                )
+            }.onFailure { error ->
+                TrackerRuntime.lastMessage = "Screenshot save failed: ${error.message ?: error.javaClass.simpleName}"
+            }
+
+            val screenshotPath = fileResult.getOrNull()?.absolutePath
+            ocrEngine.recognizeNative(bitmap, analysisExecutor) { ocrResult ->
+                handleNativeOcr(ocrResult, capturedAtMs, screenshotPath, generation, identity)
+            }
             bitmap.recycle()
         }
     }
 
-    private fun handleOcrResult(result: LightOcrResult) {
-        if (shuttingDown.get()) return
-        probeInFlight = false
-
-        val startedAtNs = probeStartedAtNs
-        probeStartedAtNs = 0L
-        if (startedAtNs != 0L) {
-            val durationMs = ((SystemClock.elapsedRealtimeNanos() - startedAtNs) / 1_000_000L)
-                .coerceAtLeast(0L)
-            TrackerRuntime.lastOcrDurationMs = durationMs
-            TrackerRuntime.totalOcrDurationMs += durationMs
-            if (durationMs > TrackerRuntime.maxOcrDurationMs) {
-                TrackerRuntime.maxOcrDurationMs = durationMs
-            }
-
-            val now = System.currentTimeMillis()
-            if (durationMs >= SLOW_OCR_LOG_THRESHOLD_MS &&
-                now - lastSlowOcrLoggedAtMs >= SLOW_OCR_LOG_COOLDOWN_MS
-            ) {
-                lastSlowOcrLoggedAtMs = now
-                queueDiagnosticsSnapshot(
-                    event = "slow_ocr",
-                    extra = JSONObject().put("durationMs", durationMs)
-                )
-            }
-        }
-
-        if (result.textPreview.isNotBlank()) {
-            TrackerRuntime.lastOcrText = result.textPreview
-        }
-
-        if (result.error != null) {
-            TrackerRuntime.lastMessage = "Light OCR error: ${result.error}"
+    private fun handleNativeOcr(
+        result: Result<List<com.example.rhythmtracker.vision.VisionLine>>,
+        capturedAtMs: Long,
+        screenshotPath: String?,
+        generation: Long,
+        identity: ResultIdentity?
+    ) {
+        result.onFailure { error ->
+            TrackerRuntime.lastMessage = "Native OCR failed: ${error.message ?: error.javaClass.simpleName}"
             queueDiagnosticsSnapshot(
-                event = "ocr_error",
-                extra = JSONObject().put("message", result.error)
+                event = "native_ocr_error",
+                extra = JSONObject().put("message", TrackerRuntime.lastMessage)
             )
-            scheduleNextProbe(PROBE_INTERVAL_MS)
             return
         }
 
-        if (result.isResultLike) {
-            TrackerRuntime.ocrHits += 1
-            consecutiveMisses = 0
-            val words = result.matchedKeywords.joinToString(", ")
-
-            if (resultArmed) {
-                resultArmed = false
-                TrackerRuntime.lastMessage = "Result-like OCR hit [$words]; capturing native frame"
-                queueDiagnosticsSnapshot(
-                    event = "ocr_result_hit",
-                    extra = JSONObject().put("keywords", words)
-                )
-                beginNativeResultCapture()
-                return
-            }
-
-            TrackerRuntime.lastMessage = "Result screen still present [$words]; duplicate suppressed"
-        } else if (!resultArmed) {
-            consecutiveMisses += 1
-            if (consecutiveMisses >= REARM_AFTER_MISSES) {
-                resultArmed = true
-                consecutiveMisses = 0
-                TrackerRuntime.lastMessage = "Result gate re-armed after screen changed"
-            }
-        } else {
-            TrackerRuntime.lastMessage = "OCR probe OK; no result signature"
-        }
-
-        scheduleNextProbe(PROBE_INTERVAL_MS)
-    }
-
-    /** Expensive surface transition happens only after the song is already over. */
-    private fun beginNativeResultCapture() {
-        if (burstInProgress || shuttingDown.get()) return
-        val display = virtualDisplay ?: return
-        if (sourceWidth <= 0 || sourceHeight <= 0) return
-
-        burstInProgress = true
-        burstFramesSeen = 0
-        captureHandler.removeCallbacks(probeRunnable)
-        captureHandler.removeCallbacks(burstTimeoutRunnable)
-
-        runCatching { display.setSurface(null) }
-        closeBurstReader()
-
-        val reader = ImageReader.newInstance(
-            sourceWidth,
-            sourceHeight,
-            PixelFormat.RGBA_8888,
-            2
+        val parsed = parser.parse(result.getOrThrow())
+        val resolution = parsed.title?.let { chartIndex?.resolveTitle(it) }
+        val playResult = PlayResult(
+            id = UUID.randomUUID().toString(),
+            capturedAtMs = capturedAtMs,
+            gameId = "arcaea",
+            songId = resolution?.song?.id,
+            difficulty = resolution?.chart?.difficulty,
+            title = parsed.title,
+            artist = parsed.artist,
+            trackState = parsed.trackState,
+            score = parsed.score ?: identity?.score,
+            pure = parsed.pure,
+            far = parsed.far,
+            lost = parsed.lost,
+            confidence = parsed.confidence,
+            screenshotPath = screenshotPath,
+            rawOcr = parsed.rawText,
+            source = "media-projection-v2"
         )
-        reader.setOnImageAvailableListener(::onBurstImageAvailable, captureHandler)
-        burstReader = reader
 
-        display.resize(sourceWidth, sourceHeight, densityDpi)
-        display.setSurface(reader.surface)
-        TrackerRuntime.captureSize = "${sourceWidth}x${sourceHeight} native result capture"
-
-        captureHandler.postDelayed(burstTimeoutRunnable, BURST_TIMEOUT_MS)
-    }
-
-    private fun onBurstImageAvailable(reader: ImageReader) {
-        val image = runCatching { reader.acquireLatestImage() }.getOrNull() ?: return
-
-        if (!burstInProgress || shuttingDown.get()) {
-            image.close()
-            return
+        ioExecutor.execute {
+            runCatching { resultStore.append(playResult) }
+                .onSuccess { TrackerRuntime.savedResults += 1 }
+                .onFailure { error ->
+                    TrackerRuntime.lastMessage = "Result save failed: ${error.message ?: error.javaClass.simpleName}"
+                }
         }
 
-        burstFramesSeen += 1
-
-        // Drop the first post-resize frame. The second is less likely to contain a transition
-        // artifact from switching the VirtualDisplay to native resolution.
-        if (burstFramesSeen < BURST_FRAME_TARGET) {
-            image.close()
-            return
-        }
-
-        val bitmap = try {
-            imageToBitmap(image)
-        } finally {
-            image.close()
-        }
-
-        val capturedAtMs = System.currentTimeMillis()
-        restoreProbeSurface("Native result frame captured; saving PNG")
-
-        analysisExecutor.execute {
-            try {
-                val file = captureStore.save(bitmap, capturedAtMs)
-                TrackerRuntime.capturedScreens += 1
-                TrackerRuntime.lastCapturePath = file.absolutePath
-                TrackerRuntime.lastMessage = "Saved result screen: ${file.name}"
-                queueDiagnosticsSnapshot(
-                    event = "native_capture_saved",
-                    extra = JSONObject()
-                        .put("file", file.name)
-                        .put("capturedAtMs", capturedAtMs)
-                )
-            } catch (error: Throwable) {
-                TrackerRuntime.lastMessage =
-                    "Result screenshot save failed: ${error.message ?: error.javaClass.simpleName}"
-                queueDiagnosticsSnapshot(
-                    event = "native_capture_save_error",
-                    extra = JSONObject().put("message", TrackerRuntime.lastMessage)
-                )
-            } finally {
-                bitmap.recycle()
+        TrackerRuntime.lastOcrText = buildString {
+            append(parsed.title ?: "?")
+            append(" | ")
+            append(parsed.trackState ?: "?")
+            append(" | ")
+            append(parsed.score ?: identity?.score ?: "?")
+            if (parsed.pure != null || parsed.far != null || parsed.lost != null) {
+                append(" | P/F/L ")
+                append(parsed.pure ?: "?")
+                append('/')
+                append(parsed.far ?: "?")
+                append('/')
+                append(parsed.lost ?: "?")
             }
         }
+        TrackerRuntime.lastMessage = "Parsed distinct result; confidence=${"%.2f".format(parsed.confidence)}"
+
+        // A slow old native pass is allowed to persist its result, but not overwrite the visual
+        // debugger after a newer result has already been accepted.
+        if (generation == latestCaptureGeneration) {
+            DebugBus.publish(
+                DebugSnapshot(
+                    visible = true,
+                    stage = VisionStage.NATIVE,
+                    stateLabel = "LIVE",
+                    regions = parsed.regions
+                )
+            )
+        }
+        queueDiagnosticsSnapshot(
+            event = "native_result_parsed",
+            extra = JSONObject()
+                .put("generation", generation)
+                .put("title", parsed.title)
+                .put("score", parsed.score)
+                .put("confidence", parsed.confidence.toDouble())
+        )
     }
 
-    private fun restoreProbeSurface(message: String) {
-        captureHandler.removeCallbacks(burstTimeoutRunnable)
-        val display = virtualDisplay
-
-        if (display != null) {
-            runCatching { display.setSurface(null) }
-        }
-
-        closeBurstReader()
-
-        val reader = probeReader
-        if (display != null && reader != null && !shuttingDown.get()) {
-            // Discard anything left from before the native-result burst.
-            runCatching { reader.acquireLatestImage()?.close() }
-            display.resize(probeWidth, probeHeight, densityDpi)
-            display.setSurface(reader.surface)
-        }
-
-        burstInProgress = false
-        burstFramesSeen = 0
-        TrackerRuntime.captureSize = "${probeWidth}x${probeHeight} persistent OCR probe"
-        TrackerRuntime.lastMessage = message
-        scheduleNextProbe(350L)
+    private fun recordOcrDuration() {
+        val started = probeStartedAtNs
+        probeStartedAtNs = 0L
+        if (started == 0L) return
+        val duration = ((SystemClock.elapsedRealtimeNanos() - started) / 1_000_000L).coerceAtLeast(0L)
+        TrackerRuntime.lastOcrDurationMs = duration
+        TrackerRuntime.totalOcrDurationMs += duration
+        if (duration > TrackerRuntime.maxOcrDurationMs) TrackerRuntime.maxOcrDurationMs = duration
     }
 
-    private fun scheduleNextProbe(delayMs: Long) {
+    private fun scheduleProbe(delayMs: Long) {
         captureHandler.removeCallbacks(probeRunnable)
-        if (TrackerRuntime.active && !shuttingDown.get() && !burstInProgress) {
+        if (TrackerRuntime.active && !shuttingDown.get() && !frameSource.isNativeCaptureActive()) {
             captureHandler.postDelayed(probeRunnable, delayMs)
         }
-    }
-
-    private fun handleSourceResize(width: Int, height: Int) {
-        if (width <= 0 || height <= 0 || shuttingDown.get()) return
-
-        sourceWidth = width
-        sourceHeight = height
-
-        // If a result capture is in progress, the updated dimensions will be used after it
-        // returns to probe mode. Avoid tearing down the active native capture midway through.
-        if (burstInProgress) return
-
-        val (newProbeWidth, newProbeHeight) = probeDimensions(width, height)
-        if (newProbeWidth == probeWidth && newProbeHeight == probeHeight) return
-
-        rebuildProbeReader(width, height)
-        queueDiagnosticsSnapshot(
-            event = "probe_resized",
-            extra = JSONObject()
-                .put("sourceWidth", width)
-                .put("sourceHeight", height)
-                .put("probeWidth", probeWidth)
-                .put("probeHeight", probeHeight)
-        )
-    }
-
-    private fun rebuildProbeReader(sourceW: Int, sourceH: Int) {
-        val display = virtualDisplay
-        if (display != null) runCatching { display.setSurface(null) }
-
-        probeReader?.close()
-        probeReader = null
-        createProbeReader(sourceW, sourceH)
-
-        val reader = probeReader
-        if (display != null && reader != null) {
-            display.resize(probeWidth, probeHeight, densityDpi)
-            display.setSurface(reader.surface)
-        }
-
-        TrackerRuntime.captureSize = "${probeWidth}x${probeHeight} persistent OCR probe"
-        TrackerRuntime.lastMessage = "Probe resized after captured-content size changed"
-        scheduleNextProbe(250L)
-    }
-
-    private fun createProbeReader(sourceW: Int, sourceH: Int) {
-        val (width, height) = probeDimensions(sourceW, sourceH)
-        probeWidth = width
-        probeHeight = height
-
-        // No image listener here on purpose. We pull acquireLatestImage() only on the probe
-        // cadence instead of waking app code at display refresh rate.
-        probeReader = ImageReader.newInstance(
-            width,
-            height,
-            PixelFormat.RGBA_8888,
-            2
-        )
-    }
-
-    private fun closeBurstReader() {
-        burstReader?.setOnImageAvailableListener(null, null)
-        runCatching { burstReader?.close() }
-        burstReader = null
-    }
-
-    private fun probeDimensions(sourceW: Int, sourceH: Int): Pair<Int, Int> {
-        val longest = max(sourceW, sourceH).coerceAtLeast(1)
-        val scale = (PROBE_LONG_EDGE_PX.toFloat() / longest.toFloat()).coerceAtMost(1f)
-        val width = (sourceW * scale).roundToInt().coerceAtLeast(2)
-        val height = (sourceH * scale).roundToInt().coerceAtLeast(2)
-        return width to height
     }
 
     private fun currentDisplayBounds(): Pair<Int, Int> {
@@ -556,66 +454,36 @@ class CaptureService : Service() {
         }
     }
 
-    private fun imageToBitmap(image: Image): Bitmap {
-        val plane = image.planes[0]
-        val buffer = plane.buffer
-        val pixelStride = plane.pixelStride
-        val rowStride = plane.rowStride
-        val rowPadding = rowStride - pixelStride * image.width
-        val paddedWidth = image.width + rowPadding / pixelStride
-
-        val padded = Bitmap.createBitmap(paddedWidth, image.height, Bitmap.Config.ARGB_8888)
-        buffer.rewind()
-        padded.copyPixelsFromBuffer(buffer)
-
-        if (paddedWidth == image.width) return padded
-
-        val cropped = Bitmap.createBitmap(padded, 0, 0, image.width, image.height)
-        padded.recycle()
-        return cropped
-    }
-
     private fun queueDiagnosticsSnapshot(event: String? = null, extra: JSONObject? = null) {
         if (!ownsSession) return
         val snapshot = diagnosticStore.snapshotFromRuntime()
         runCatching {
-            diagnosticExecutor.execute {
+            ioExecutor.execute {
                 diagnosticStore.saveSnapshot(snapshot)
                 if (event != null) diagnosticStore.appendEvent(event, snapshot, extra)
             }
         }
     }
 
-    private fun saveDiagnosticsNow(event: String? = null, appendEvent: Boolean = false) {
+    private fun saveDiagnosticsNow(event: String) {
         if (!ownsSession) return
         val snapshot = diagnosticStore.snapshotFromRuntime()
         diagnosticStore.saveSnapshot(snapshot)
-        if (appendEvent && event != null) {
-            diagnosticStore.appendEvent(event, snapshot)
-        }
+        diagnosticStore.appendEvent(event, snapshot)
     }
 
     private fun shutdownProjection(requestProjectionStop: Boolean) {
         if (!shuttingDown.compareAndSet(false, true)) return
-
         TrackerRuntime.active = false
         probeInFlight = false
-        probeStartedAtNs = 0L
-        burstInProgress = false
+        stateMachine.reset()
+        DebugBus.clear()
 
         if (::captureHandler.isInitialized) {
             captureHandler.removeCallbacks(probeRunnable)
-            captureHandler.removeCallbacks(burstTimeoutRunnable)
             captureHandler.removeCallbacks(diagnosticRunnable)
         }
-
-        runCatching { virtualDisplay?.setSurface(null) }
-        runCatching { virtualDisplay?.release() }
-        virtualDisplay = null
-
-        probeReader?.close()
-        probeReader = null
-        closeBurstReader()
+        if (::frameSource.isInitialized) frameSource.close()
 
         val projection = mediaProjection
         mediaProjection = null
@@ -626,21 +494,20 @@ class CaptureService : Service() {
 
         TrackerRuntime.captureSize = "-"
         if (ownsSession) {
-            saveDiagnosticsNow("session_stop", appendEvent = true)
+            saveDiagnosticsNow("session_stop")
             ownsSession = false
         }
     }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT < 26) return
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.createNotificationChannel(
+        getSystemService(NotificationManager::class.java).createNotificationChannel(
             NotificationChannel(
                 CHANNEL_ID,
-                "RenderMyMind tracking session",
+                "RenderMyMind tracking",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Shown while lightweight result-screen tracking is active"
+                description = "Shown while result-screen tracking is active"
                 setShowBadge(false)
             }
         )
@@ -659,15 +526,13 @@ class CaptureService : Service() {
             Intent(this, CaptureService::class.java).apply { action = ACTION_STOP },
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-
         return Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_tracking)
             .setContentTitle("RenderMyMind Alpha active")
-            .setContentText("Persistent low-res OCR probe is watching for result screens")
+            .setContentText("V2 result pipeline is watching for Arcaea results")
             .setContentIntent(openIntent)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
-            .setWhen(System.currentTimeMillis())
             .addAction(Notification.Action.Builder(null, "STOP", stopIntent).build())
             .build()
     }
@@ -681,16 +546,7 @@ class CaptureService : Service() {
 
         private const val CHANNEL_ID = "rhythm_tracking"
         private const val NOTIFICATION_ID = 7101
-
-        private const val PROBE_LONG_EDGE_PX = 480
-        private const val PROBE_INTERVAL_MS = 900L
-        private const val PROBE_EMPTY_RETRY_MS = 120L
-        private const val BURST_TIMEOUT_MS = 1_500L
-        private const val BURST_FRAME_TARGET = 2
-        private const val REARM_AFTER_MISSES = 2
-
-        private const val DIAGNOSTIC_SNAPSHOT_INTERVAL_MS = 15_000L
-        private const val SLOW_OCR_LOG_THRESHOLD_MS = 200L
-        private const val SLOW_OCR_LOG_COOLDOWN_MS = 30_000L
+        private const val PROBE_EMPTY_RETRY_MS = 100L
+        private const val DIAGNOSTIC_INTERVAL_MS = 15_000L
     }
 }
