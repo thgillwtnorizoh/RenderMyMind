@@ -16,6 +16,7 @@ import android.widget.TextView
 import com.example.rhythmtracker.R
 import com.example.rhythmtracker.detection.ArcaeaResultDetector
 import com.example.rhythmtracker.game.arcaea.ArcaeaChartIndex
+import com.example.rhythmtracker.game.arcaea.ArcaeaChartMarker
 import com.example.rhythmtracker.game.arcaea.ArcaeaDatabaseStore
 import com.example.rhythmtracker.identity.VisualFingerprint
 import com.example.rhythmtracker.parser.ArcaeaResultParser
@@ -126,7 +127,14 @@ class ResultInspectionActivity : Activity() {
                     val inspection = ocrResult.map { lines ->
                         val detection = detector.detect(lines, fingerprint, VisionStage.NATIVE)
                         val parsed = parser.parse(lines)
-                        val resolution = parsed.title?.let { chartIndex?.resolveTitle(it) }
+                        val resolution = parsed.title?.let { title ->
+                            chartIndex?.resolveResultTitle(
+                                rawTitle = title,
+                                displayedDifficulty = parsed.displayedDifficulty,
+                                hiddenOnScreen = parsed.chartHiddenOnScreen
+                            )
+                        }
+                        val resolvedChart = resolution?.chart
                         val regions = (detection.regions + parsed.regions)
                             .distinctBy { regionKey(it) }
 
@@ -147,9 +155,19 @@ class ResultInspectionActivity : Activity() {
                             pure = parsed.pure,
                             far = parsed.far,
                             lost = parsed.lost,
+                            displayedDifficulty = parsed.displayedDifficulty,
+                            displayedDifficultyLabel = parsed.displayedDifficultyLabel,
+                            displayedLevel = parsed.displayedLevel,
+                            chartHiddenOnScreen = parsed.chartHiddenOnScreen,
                             confidence = parsed.confidence,
                             songId = resolution?.song?.id,
-                            difficulty = resolution?.chart?.difficulty,
+                            resolvedDifficulty = resolvedChart?.difficulty,
+                            resolvedLevel = resolvedChart?.level,
+                            databaseVisibility = when {
+                                resolvedChart != null -> resolvedChart.visibilityDescription()
+                                parsed.chartHiddenOnScreen && resolution?.song != null -> "metadata unavailable / ambiguous hidden chart"
+                                else -> "-"
+                            },
                             rawOcr = parsed.rawText
                         )
                     }
@@ -279,10 +297,32 @@ class ResultInspectionActivity : Activity() {
         appendLine("track state      : ${value.trackState ?: "-"}")
         appendLine("score            : ${value.score?.let(::formatScore) ?: "-"}")
         appendLine("PURE / FAR / LOST: ${value.pure ?: "-"} / ${value.far ?: "-"} / ${value.lost ?: "-"}")
+        appendLine("displayed chart  : ${displayedChartText(value)}")
+        appendLine("screen chart state: ${ArcaeaChartMarker.visibilityLabel(value.chartHiddenOnScreen)}")
         appendLine("parse confidence : ${"%.2f".format(value.confidence)}")
-        appendLine("database match   : ${value.songId ?: "-"}${value.difficulty?.let { " / $it" } ?: ""}")
+        appendLine("database match   : ${value.songId ?: "-"}")
+        appendLine("resolved chart   : ${resolvedChartText(value)}")
+        appendLine("database visibility: ${value.databaseVisibility}")
         appendLine()
         append("raw OCR          : ${value.rawOcr.ifBlank { "-" }}")
+    }
+
+    private fun displayedChartText(value: Inspection): String = when {
+        value.chartHiddenOnScreen -> "${value.displayedDifficultyLabel ?: "???"} / ${value.displayedLevel ?: "?"}"
+        value.displayedDifficulty != null -> buildString {
+            append(value.displayedDifficultyLabel ?: value.displayedDifficulty)
+            append(" (")
+            append(value.displayedDifficulty)
+            append(')')
+            value.displayedLevel?.let { append(" / $it") }
+        }
+        else -> "-"
+    }
+
+    private fun resolvedChartText(value: Inspection): String = when {
+        value.resolvedDifficulty == null -> "-"
+        value.resolvedLevel != null -> "${value.resolvedDifficulty} / ${value.resolvedLevel}"
+        else -> value.resolvedDifficulty
     }
 
     private fun formatScore(value: Long): String {
@@ -321,9 +361,15 @@ class ResultInspectionActivity : Activity() {
         val pure: Int?,
         val far: Int?,
         val lost: Int?,
+        val displayedDifficulty: String?,
+        val displayedDifficultyLabel: String?,
+        val displayedLevel: String?,
+        val chartHiddenOnScreen: Boolean,
         val confidence: Float,
         val songId: String?,
-        val difficulty: String?,
+        val resolvedDifficulty: String?,
+        val resolvedLevel: String?,
+        val databaseVisibility: String,
         val rawOcr: String
     )
 
