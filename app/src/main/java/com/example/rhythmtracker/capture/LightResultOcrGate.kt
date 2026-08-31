@@ -25,6 +25,10 @@ import kotlin.math.abs
  * result-only structure such as TRACK COMPLETE / TRACK LOST, two judgement labels, or MAX RECALL
  * plus a score-shaped number can confirm the same screen when the tiny header is missed.
  *
+ * LIGHT also keeps a cheap identity for the live result using the large current-score line. That
+ * lets a new result replace the previous one even when there was never a non-result frame between
+ * them, which is common while testing screenshots or rapidly switching samples.
+ *
  * NATIVE runs once after LIGHT confirms a result. It keeps the full captured frame at its original
  * resolution and combines the bundled Latin, Chinese, Japanese and Korean recognisers. Semantic
  * regions are derived from detected geometry rather than fixed song-title rectangles.
@@ -42,6 +46,9 @@ class LightResultOcrGate : Closeable {
         KoreanTextRecognizerOptions.Builder().build()
     )
 
+    private var lastLightResultIdentity: String? = null
+    private var lightAbsentStreak = 0
+
     fun inspect(
         frame: Bitmap,
         callbackExecutor: Executor,
@@ -57,6 +64,24 @@ class LightResultOcrGate : Closeable {
                 val lines = extractLines(text, working.width, working.height, "latin")
                 val result = classifyLight(lines)
                 VisionDebugState.update(result)
+
+                // CaptureService historically re-armed only after two non-result probes. When a
+                // different score appears while a result is continuously on screen, send that same
+                // two-miss re-arm signal immediately, then deliver the real new result. These
+                // synthetic misses are intentionally NOT published to VisionDebugState, so the UI
+                // does not blink off while the native recapture starts.
+                if (shouldRearmForIdentityChange(result)) {
+                    val rearmPulse = result.copy(
+                        isResultLike = false,
+                        matchedKeywords = setOf("IDENTITY_CHANGE_REARM"),
+                        textPreview = "",
+                        regionReadings = emptyList(),
+                        resultIdentity = null
+                    )
+                    callback(rearmPulse)
+                    callback(rearmPulse)
+                }
+
                 callback(result)
             }
             .addOnFailureListener(callbackExecutor) { error ->
@@ -65,6 +90,7 @@ class LightResultOcrGate : Closeable {
                     matchedKeywords = emptySet(),
                     textPreview = "",
                     regionReadings = emptyList(),
+                    resultIdentity = null,
                     pass = OcrPass.LIGHT,
                     error = error.message ?: error.javaClass.simpleName
                 )
@@ -127,6 +153,29 @@ class LightResultOcrGate : Closeable {
         koreanRecognizer.close()
     }
 
+    @Synchronized
+    private fun shouldRearmForIdentityChange(result: LightOcrResult): Boolean {
+        if (!result.isResultLike) {
+            lightAbsentStreak += 1
+            if (lightAbsentStreak >= LIGHT_ABSENT_TO_RESET_IDENTITY) {
+                lastLightResultIdentity = null
+            }
+            return false
+        }
+
+        lightAbsentStreak = 0
+        val identity = result.resultIdentity ?: return false
+        val previous = lastLightResultIdentity
+        if (previous == null) {
+            lastLightResultIdentity = identity
+            return false
+        }
+        if (previous == identity) return false
+
+        lastLightResultIdentity = identity
+        return true
+    }
+
     private fun classifyLight(lines: List<DetectedLine>): LightOcrResult {
         val signature = detectResultSignature(lines)
         val preview = lines
@@ -139,6 +188,7 @@ class LightResultOcrGate : Closeable {
             matchedKeywords = signature.matched,
             textPreview = preview,
             regionReadings = signature.anchorReadings,
+            resultIdentity = if (signature.resultLike) scoreIdentity(lines) else null,
             pass = OcrPass.LIGHT,
             error = null
         )
@@ -177,6 +227,7 @@ class LightResultOcrGate : Closeable {
             matchedKeywords = signature.matched,
             textPreview = preview,
             regionReadings = readings,
+            resultIdentity = if (signature.resultLike) scoreIdentity(lines) else null,
             pass = OcrPass.NATIVE,
             error = if (errors.size == NATIVE_RECOGNIZER_COUNT) errors.joinToString("; ") else null
         )
@@ -196,9 +247,7 @@ class LightResultOcrGate : Closeable {
         }
 
         val maxRecall = lines.firstOrNull { looksLikeMaxRecall(it.text) }
-        val score = lines
-            .filter { scoreDigitCount(it.text) in 7..8 }
-            .maxWithOrNull(compareBy<DetectedLine> { it.bounds.height() }.thenBy { it.bounds.width() })
+        val score = currentScoreLine(lines)
 
         val matched = linkedSetOf<String>()
         if (resultTripwire != null) matched += "RESULT"
@@ -265,12 +314,10 @@ class LightResultOcrGate : Closeable {
 
         track?.toReading("track_state", "TRACK STATE")?.let(result::add)
 
-        val score = lines
-            .filter { line ->
-                val cy = line.bounds.centerY()
-                cy > height * 0.24f && cy < height * 0.70f && scoreDigitCount(line.text) in 7..8
-            }
-            .maxWithOrNull(compareBy<DetectedLine> { it.bounds.height() }.thenBy { it.bounds.width() })
+        val score = currentScoreLine(lines)?.takeIf { line ->
+            val cy = line.bounds.centerY()
+            cy > height * 0.24f && cy < height * 0.70f
+        }
         score?.toReading("score", "SCORE")?.let(result::add)
 
         val judgementLabels = lines.filter { line ->
@@ -358,6 +405,21 @@ class LightResultOcrGate : Closeable {
             if (!duplicate) accepted += candidate
         }
         return accepted
+    }
+
+    private fun currentScoreLine(lines: List<DetectedLine>): DetectedLine? {
+        return lines
+            .filter { scoreDigitCount(it.text) in 7..8 }
+            .filterNot { gateNormalize(it.text).contains("HIGH SCORE") }
+            .maxWithOrNull(
+                compareBy<DetectedLine> { it.bounds.height() }
+                    .thenBy { it.bounds.width() }
+            )
+    }
+
+    private fun scoreIdentity(lines: List<DetectedLine>): String? {
+        val digits = currentScoreLine(lines)?.text?.filter { it.isDigit() }.orEmpty()
+        return if (digits.length in 7..8) "score:$digits" else null
     }
 
     private fun findResultTripwire(lines: List<DetectedLine>): DetectedLine? {
@@ -498,6 +560,7 @@ class LightResultOcrGate : Closeable {
         private const val NATIVE_RECOGNIZER_COUNT = 4
         private const val LIGHT_PREVIEW_CHARS = 320
         private const val MAX_PREVIEW_CHARS = 700
+        private const val LIGHT_ABSENT_TO_RESET_IDENTITY = 2
 
         private val JUDGEMENT_ANCHORS = setOf("PURE", "FAR", "LOST")
         private val HEADER_CHROME = setOf(
@@ -526,6 +589,7 @@ data class LightOcrResult(
     val matchedKeywords: Set<String>,
     val textPreview: String,
     val regionReadings: List<OcrRegionReading>,
+    val resultIdentity: String?,
     val pass: OcrPass,
     val error: String?
 )
