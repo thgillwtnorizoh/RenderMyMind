@@ -82,10 +82,10 @@ data class ArcaeaChartClassification(
         val normalizedExpected = normalizeDifficulty(expectedDifficulty) ?: return null
         val semantic = semanticDifficulty()
         if (semantic != normalizedExpected) {
-            return "$normalizedExpected classified as ${semantic ?: "unknown"} ($description())"
+            return "$normalizedExpected classified as ${semantic ?: "unknown"} (${description()})"
         }
         if (normalizedExpected == "INS" && ratingClassAlias != 1) {
-            return "INS requires ratingClassAlias=1 ($description())"
+            return "INS requires ratingClassAlias=1 (${description()})"
         }
         return null
     }
