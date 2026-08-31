@@ -23,6 +23,7 @@ data class VisionDebugSnapshot(
     val matchedAnchors: Set<String>,
     val textPreview: String,
     val regionReadings: List<OcrRegionReading>,
+    val resultIdentity: String?,
     val pass: OcrPass,
     val error: String?
 )
@@ -37,6 +38,7 @@ object VisionDebugState {
             matchedAnchors = emptySet(),
             textPreview = "",
             regionReadings = emptyList(),
+            resultIdentity = null,
             pass = OcrPass.LIGHT,
             error = null
         )
@@ -49,9 +51,10 @@ object VisionDebugState {
      * out for ~900 ms and then pop back in. Two consecutive LIGHT misses are required to declare
      * that the result screen has actually gone away.
      *
-     * Once the native pass has produced the useful dynamic geometry, successful LIGHT probes only
-     * prove that the same result is still present. They do not replace that geometry with the tiny
-     * tripwire box. A weak native pass also cannot erase a result that LIGHT just confirmed.
+     * Once the native pass has produced useful geometry, successful LIGHT probes for the SAME
+     * result only prove that it is still present. A changed score identity is different: publish
+     * that LIGHT result immediately so old native text cannot haunt the next sample while the new
+     * full-resolution capture is starting.
      */
     @Synchronized
     fun update(result: LightOcrResult) {
@@ -61,7 +64,14 @@ object VisionDebugState {
         if (result.pass == OcrPass.LIGHT) {
             if (result.isResultLike) {
                 lightMissStreak = 0
-                if (previous.resultLike && previous.pass == OcrPass.NATIVE) {
+                val sameIdentity = previous.resultIdentity != null &&
+                    result.resultIdentity != null &&
+                    previous.resultIdentity == result.resultIdentity
+                val identityUnknown = result.resultIdentity == null
+
+                if (previous.resultLike && previous.pass == OcrPass.NATIVE &&
+                    (sameIdentity || identityUnknown)
+                ) {
                     return
                 }
             } else if (previous.resultLike) {
@@ -76,8 +86,8 @@ object VisionDebugState {
             if (result.isResultLike) {
                 lightMissStreak = 0
             } else if (previous.resultLike) {
-                // The native parser is allowed to be imperfect. Presence is owned by LIGHT, so
-                // wait for LIGHT misses instead of blanking the overlay here.
+                // Presence is owned by LIGHT. A weak native parse must not erase a result that
+                // the lightweight detector just confirmed.
                 return
             }
         }
@@ -89,6 +99,7 @@ object VisionDebugState {
                 matchedAnchors = result.matchedKeywords.toSet(),
                 textPreview = result.textPreview,
                 regionReadings = result.regionReadings,
+                resultIdentity = result.resultIdentity,
                 pass = result.pass,
                 error = result.error
             )
@@ -186,7 +197,11 @@ object VisionDebugOverlay {
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                // Crucial for OCR debugging: the user can see this overlay, but MediaProjection
+                // must not. Otherwise our own labels cover Arcaea's Result/track/title text and
+                // the detector starts OCRing itself.
+                WindowManager.LayoutParams.FLAG_SECURE,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
@@ -275,12 +290,13 @@ private class VisionDebugView(context: Context) : View(context) {
 
     private fun drawGateStatus(canvas: Canvas) {
         val anchors = snapshot.matchedAnchors.joinToString(", ").ifBlank { "RESULT" }
-        val text = "VISION ${snapshot.pass}: RESULT LIVE  |  anchors: $anchors"
+        val identity = snapshot.resultIdentity?.removePrefix("score:")?.let { " | score-id: $it" }.orEmpty()
+        val text = "VISION ${snapshot.pass}: RESULT LIVE  |  anchors: $anchors$identity"
         val padding = 6f * density
-        val maxWidth = width * 0.32f - padding * 2
+        val maxWidth = width * 0.38f - padding * 2
         val fitted = fitText(text, statusTextPaint, maxWidth)
         val h = statusTextPaint.fontMetrics.run { bottom - top } + padding * 2
-        val box = RectF(padding, padding, width * 0.32f, padding + h)
+        val box = RectF(padding, padding, width * 0.38f, padding + h)
         canvas.drawRoundRect(box, 5f * density, 5f * density, labelBackgroundPaint)
         val baseline = box.top + padding - statusTextPaint.fontMetrics.top
         canvas.drawText(fitted, box.left + padding, baseline, statusTextPaint)
