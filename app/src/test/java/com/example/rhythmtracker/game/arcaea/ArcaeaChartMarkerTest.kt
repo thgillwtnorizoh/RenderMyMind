@@ -25,7 +25,7 @@ class ArcaeaChartMarkerTest {
     fun questionMarksAreAValidHiddenMarker() {
         assertTrue(ArcaeaChartMarker.isHiddenDifficulty("???"))
         assertTrue(ArcaeaChartMarker.isHiddenDifficulty("？？？"))
-        assertFalse(ArcaeaChartMarker.isHiddenDifficulty("?") )
+        assertFalse(ArcaeaChartMarker.isHiddenDifficulty("?"))
         assertEquals("?", ArcaeaChartMarker.parseLevel("?"))
     }
 
@@ -60,7 +60,10 @@ class ArcaeaChartMarkerTest {
         notes = 1663,
         variantTitle = null,
         variantAliases = emptyList(),
-        hiddenUntilUnlocked = hiddenUntilUnlocked,
-        hiddenUntil = hiddenUntil
+        classification = ArcaeaChartClassification.fromSemantic("INS"),
+        visibility = ArcaeaChartVisibility(
+            hiddenUntilUnlocked = hiddenUntilUnlocked,
+            hiddenUntil = hiddenUntil
+        )
     )
 }
