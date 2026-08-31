@@ -35,6 +35,17 @@ object ArcaeaResultLayout {
             line.bounds.height() >= widthScaledPixels(line.frameWidth, 8f)
     }
 
+    /** Difficulty/level block on the left, sharing a row with MAX RECALL. */
+    fun isChartBand(line: VisionLine): Boolean {
+        val w = line.frameWidth.toFloat().coerceAtLeast(1f)
+        val h = line.frameHeight.toFloat().coerceAtLeast(1f)
+        val cx = line.bounds.centerX().toFloat()
+        val cy = line.bounds.centerY().toFloat()
+        return cx <= w * 0.36f &&
+            cy in (h * 0.15f)..(h * 0.46f) &&
+            line.bounds.height() >= widthScaledPixels(line.frameWidth, 7f)
+    }
+
     fun isTrackBand(line: VisionLine): Boolean {
         val w = line.frameWidth.toFloat().coerceAtLeast(1f)
         val h = line.frameHeight.toFloat().coerceAtLeast(1f)
