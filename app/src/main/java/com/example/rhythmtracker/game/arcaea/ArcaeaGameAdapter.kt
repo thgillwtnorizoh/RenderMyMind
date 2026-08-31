@@ -2,17 +2,37 @@ package com.example.rhythmtracker.game.arcaea
 
 import com.example.rhythmtracker.game.GameAdapter
 import com.example.rhythmtracker.game.LightTextDecision
+import java.util.Locale
 
-/**
- * Arcaea-specific result gate.
- *
- * The always-on probe is intentionally tiny, so result-state text can lose one or two glyphs
- * before it reaches ML Kit (for example TRACK OMPLETE or TRACK CONP). The gate therefore treats
- * TRACK + a close-enough prefix of COMPLETE/LOST as the canonical result state instead of
- * requiring a byte-perfect OCR transcription.
- */
+/** Arcaea-specific result-screen interpretation. */
 class ArcaeaGameAdapter : GameAdapter {
     override val gameId: String = "arcaea"
+
+    /**
+     * Arcaea keeps a small `Result` label in the top navigation while a result screen is live.
+     * This is a much cheaper and more stable tripwire than continuously OCRing the score panel.
+     * The caller searches for this line dynamically, so no X/Y box is baked into the adapter.
+     */
+    override fun classifyTripwireText(normalizedText: String): LightTextDecision {
+        if (normalizedText.isBlank()) return LightTextDecision(false, emptySet())
+
+        val compact = normalizedText
+            .uppercase(Locale.US)
+            .filter { it.isLetterOrDigit() }
+
+        if (compact.length !in 5..10) return LightTextDecision(false, emptySet())
+
+        val exactOrAttached = compact == RESULT_HEADER ||
+            (compact.startsWith(RESULT_HEADER) && compact.length <= RESULT_HEADER.length + 4)
+        val fuzzy = compact.length in 5..7 &&
+            levenshtein(compact, RESULT_HEADER, 1) <= 1
+
+        return if (exactOrAttached || fuzzy) {
+            LightTextDecision(true, setOf("RESULT HEADER"))
+        } else {
+            LightTextDecision(false, emptySet())
+        }
+    }
 
     override fun classifyLightText(normalizedText: String): LightTextDecision {
         if (normalizedText.isBlank()) return LightTextDecision(false, emptySet())
@@ -23,7 +43,7 @@ class ArcaeaGameAdapter : GameAdapter {
         }
 
         val compact = normalizedText
-            .uppercase()
+            .uppercase(Locale.US)
             .filter { it.isLetterOrDigit() }
 
         val fuzzyComplete = looksLikeTrackState(compact, "COMPLETE")
@@ -58,8 +78,7 @@ class ArcaeaGameAdapter : GameAdapter {
 
     /**
      * Compare several prefixes after TRACK with the beginning of the expected state. Testing the
-     * short prefixes matters because region text is concatenated in the composite: TRACK CONP can
-     * otherwise become TRACKCONP09986622 and look much farther from COMPLETE than it really is.
+     * short prefixes matters because OCR can turn TRACK COMPLETE into TRACK CONP or similar noise.
      */
     private fun looksLikeTrackState(compactText: String, expectedState: String): Boolean {
         var searchFrom = 0
@@ -110,11 +129,12 @@ class ArcaeaGameAdapter : GameAdapter {
 
     private fun containsArcaeaScore(text: String): Boolean {
         return SCORE_CANDIDATE.findAll(text).any { match ->
-            match.value.count { it.isDigit() } in 7..8
+            match.value.count { it.isDigit() } in 5..8
         }
     }
 
     companion object {
+        private const val RESULT_HEADER = "RESULT"
         private const val MIN_FUZZY_STATE_CHARS = 4
 
         private val JUDGEMENT_ANCHORS = setOf("PURE", "FAR", "LOST")
@@ -125,7 +145,7 @@ class ArcaeaGameAdapter : GameAdapter {
         // Accept separators Arcaea commonly renders between score groups. The digit count is
         // checked separately so timestamps and small counters do not become score signals.
         private val SCORE_CANDIDATE = Regex(
-            "(?<!\\d)\\d(?:[\\d'’.,\\s]{5,14})\\d(?!\\d)"
+            "(?<!\\d)\\d(?:[\\d'’.,\\s]{3,14})\\d(?!\\d)"
         )
     }
 }
