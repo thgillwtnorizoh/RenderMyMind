@@ -28,7 +28,7 @@ data class VisionDebugSnapshot(
 )
 
 object VisionDebugState {
-    private const val NATIVE_HOLD_MS = 8_000L
+    private const val LIGHT_MISSES_TO_CLEAR = 2
 
     private val latest = AtomicReference(
         VisionDebugSnapshot(
@@ -42,24 +42,48 @@ object VisionDebugState {
         )
     )
 
+    private var lightMissStreak = 0
+
+    /**
+     * OCR is probabilistic. A single missed probe must not make a confirmed result overlay blink
+     * out for ~900 ms and then pop back in. Two consecutive LIGHT misses are required to declare
+     * that the result screen has actually gone away.
+     *
+     * Once the native pass has produced the useful dynamic geometry, successful LIGHT probes only
+     * prove that the same result is still present. They do not replace that geometry with the tiny
+     * tripwire box. A weak native pass also cannot erase a result that LIGHT just confirmed.
+     */
+    @Synchronized
     fun update(result: LightOcrResult) {
         val now = System.currentTimeMillis()
+        val previous = latest.get()
 
-        while (true) {
-            val previous = latest.get()
-            // Keep the richer native geometry while the lightweight tripwire still confirms that
-            // the SAME result screen is live. A LIGHT miss is never suppressed: it must blank the
-            // overlay immediately when the player leaves the result screen.
-            if (result.pass == OcrPass.LIGHT &&
-                result.isResultLike &&
-                previous.pass == OcrPass.NATIVE &&
-                previous.resultLike &&
-                now - previous.updatedAtMs < NATIVE_HOLD_MS
-            ) {
+        if (result.pass == OcrPass.LIGHT) {
+            if (result.isResultLike) {
+                lightMissStreak = 0
+                if (previous.resultLike && previous.pass == OcrPass.NATIVE) {
+                    return
+                }
+            } else if (previous.resultLike) {
+                lightMissStreak += 1
+                if (lightMissStreak < LIGHT_MISSES_TO_CLEAR) {
+                    return
+                }
+            } else {
+                lightMissStreak = 0
+            }
+        } else {
+            if (result.isResultLike) {
+                lightMissStreak = 0
+            } else if (previous.resultLike) {
+                // The native parser is allowed to be imperfect. Presence is owned by LIGHT, so
+                // wait for LIGHT misses instead of blanking the overlay here.
                 return
             }
+        }
 
-            val next = VisionDebugSnapshot(
+        latest.set(
+            VisionDebugSnapshot(
                 updatedAtMs = now,
                 resultLike = result.isResultLike,
                 matchedAnchors = result.matchedKeywords.toSet(),
@@ -68,8 +92,7 @@ object VisionDebugState {
                 pass = result.pass,
                 error = result.error
             )
-            if (latest.compareAndSet(previous, next)) return
-        }
+        )
     }
 
     fun snapshot(): VisionDebugSnapshot = latest.get()
@@ -226,8 +249,8 @@ private class VisionDebugView(context: Context) : View(context) {
         super.onDraw(canvas)
         if (width <= 0 || height <= 0) return
 
-        // Debug geometry is intentionally invisible during gameplay and menus. The tiny Result
-        // tripwire is the sole permission for boxes to exist on screen.
+        // Debug geometry is intentionally invisible during gameplay and menus. Confirmed result
+        // presence is debounced in VisionDebugState so OCR jitter cannot make the boxes flicker.
         if (!snapshot.resultLike) return
 
         drawGateStatus(canvas)
@@ -252,7 +275,7 @@ private class VisionDebugView(context: Context) : View(context) {
 
     private fun drawGateStatus(canvas: Canvas) {
         val anchors = snapshot.matchedAnchors.joinToString(", ").ifBlank { "RESULT" }
-        val text = "VISION ${snapshot.pass}: RESULT LIVE  |  tripwire: $anchors"
+        val text = "VISION ${snapshot.pass}: RESULT LIVE  |  anchors: $anchors"
         val padding = 6f * density
         val maxWidth = width * 0.32f - padding * 2
         val fitted = fitText(text, statusTextPaint, maxWidth)
