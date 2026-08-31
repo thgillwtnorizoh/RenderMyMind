@@ -127,8 +127,9 @@ class ResultInspectionActivity : Activity() {
                     val inspection = ocrResult.map { lines ->
                         val detection = detector.detect(lines, fingerprint, VisionStage.NATIVE)
                         val parsed = parser.parse(lines)
+                        val indexSnapshot = chartIndex
                         val resolution = parsed.title?.let { title ->
-                            chartIndex?.resolveResultTitle(
+                            indexSnapshot?.resolveResultTitle(
                                 rawTitle = title,
                                 displayedDifficulty = parsed.displayedDifficulty,
                                 hiddenOnScreen = parsed.chartHiddenOnScreen
@@ -160,12 +161,18 @@ class ResultInspectionActivity : Activity() {
                             displayedLevel = parsed.displayedLevel,
                             chartHiddenOnScreen = parsed.chartHiddenOnScreen,
                             confidence = parsed.confidence,
+                            databaseSchema = indexSnapshot?.let {
+                                "${it.databaseFormat}/v${it.schemaVersion}"
+                            },
                             songId = resolution?.song?.id,
+                            resolutionBasis = resolution?.matchKind,
                             resolvedDifficulty = resolvedChart?.difficulty,
                             resolvedLevel = resolvedChart?.level,
+                            resolvedClassification = resolvedChart?.classificationDescription(),
                             databaseVisibility = when {
                                 resolvedChart != null -> resolvedChart.visibilityDescription()
-                                parsed.chartHiddenOnScreen && resolution?.song != null -> "metadata unavailable / ambiguous hidden chart"
+                                parsed.chartHiddenOnScreen && resolution?.song != null ->
+                                    "unresolved hidden chart"
                                 else -> "-"
                             },
                             rawOcr = parsed.rawText
@@ -287,24 +294,27 @@ class ResultInspectionActivity : Activity() {
     }
 
     private fun inspectionText(value: Inspection): String = buildString {
-        appendLine("image            : ${value.width}x${value.height}")
-        appendLine("result detected  : ${value.detected}")
-        appendLine("strong evidence  : ${value.strong}")
-        appendLine("detector strength: ${"%.2f".format(value.strength)}")
-        appendLine("anchors          : ${value.anchors.joinToString().ifBlank { "-" }}")
-        appendLine("title            : ${value.title ?: "-"}")
-        appendLine("artist           : ${value.artist ?: "-"}")
-        appendLine("track state      : ${value.trackState ?: "-"}")
-        appendLine("score            : ${value.score?.let(::formatScore) ?: "-"}")
-        appendLine("PURE / FAR / LOST: ${value.pure ?: "-"} / ${value.far ?: "-"} / ${value.lost ?: "-"}")
-        appendLine("displayed chart  : ${displayedChartText(value)}")
+        appendLine("image             : ${value.width}x${value.height}")
+        appendLine("result detected   : ${value.detected}")
+        appendLine("strong evidence   : ${value.strong}")
+        appendLine("detector strength : ${"%.2f".format(value.strength)}")
+        appendLine("anchors           : ${value.anchors.joinToString().ifBlank { "-" }}")
+        appendLine("title             : ${value.title ?: "-"}")
+        appendLine("artist            : ${value.artist ?: "-"}")
+        appendLine("track state       : ${value.trackState ?: "-"}")
+        appendLine("score             : ${value.score?.let(::formatScore) ?: "-"}")
+        appendLine("PURE / FAR / LOST : ${value.pure ?: "-"} / ${value.far ?: "-"} / ${value.lost ?: "-"}")
+        appendLine("displayed chart   : ${displayedChartText(value)}")
         appendLine("screen chart state: ${ArcaeaChartMarker.visibilityLabel(value.chartHiddenOnScreen)}")
-        appendLine("parse confidence : ${"%.2f".format(value.confidence)}")
-        appendLine("database match   : ${value.songId ?: "-"}")
-        appendLine("resolved chart   : ${resolvedChartText(value)}")
+        appendLine("parse confidence  : ${"%.2f".format(value.confidence)}")
+        appendLine("database schema   : ${value.databaseSchema ?: "-"}")
+        appendLine("database match    : ${value.songId ?: "-"}")
+        appendLine("resolution basis  : ${value.resolutionBasis ?: "-"}")
+        appendLine("resolved chart    : ${resolvedChartText(value)}")
+        appendLine("chart class       : ${value.resolvedClassification ?: "-"}")
         appendLine("database visibility: ${value.databaseVisibility}")
         appendLine()
-        append("raw OCR          : ${value.rawOcr.ifBlank { "-" }}")
+        append("raw OCR           : ${value.rawOcr.ifBlank { "-" }}")
     }
 
     private fun displayedChartText(value: Inspection): String = when {
@@ -366,9 +376,12 @@ class ResultInspectionActivity : Activity() {
         val displayedLevel: String?,
         val chartHiddenOnScreen: Boolean,
         val confidence: Float,
+        val databaseSchema: String?,
         val songId: String?,
+        val resolutionBasis: String?,
         val resolvedDifficulty: String?,
         val resolvedLevel: String?,
+        val resolvedClassification: String?,
         val databaseVisibility: String,
         val rawOcr: String
     )
