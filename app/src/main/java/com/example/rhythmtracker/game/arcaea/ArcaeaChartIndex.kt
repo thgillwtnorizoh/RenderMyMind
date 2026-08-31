@@ -93,6 +93,36 @@ class ArcaeaChartIndex private constructor(
         return candidates.singleOrNull()
     }
 
+    /**
+     * Resolve the chart marker seen on a result screen.
+     *
+     * A visible difficulty such as FUTURE or INSCRIBED is authoritative. When the screen itself
+     * deliberately shows `?` / `???`, the database may identify the chart only when exactly one
+     * chart for that song is marked hidden-until-unlocked. If the imported database does not carry
+     * that songlist metadata, the song still resolves but the chart remains unknown rather than
+     * being guessed.
+     */
+    fun resolveResultTitle(
+        rawTitle: String,
+        displayedDifficulty: String?,
+        hiddenOnScreen: Boolean
+    ): ArcaeaTitleResolution? {
+        if (displayedDifficulty != null) {
+            return resolveTitle(rawTitle, displayedDifficulty)
+        }
+
+        val base = resolveTitle(rawTitle) ?: return null
+        if (!hiddenOnScreen || base.chart != null) return base
+
+        val hiddenCharts = base.song.charts.filter { it.hiddenBeforeUnlock() == true }
+        val chart = hiddenCharts.singleOrNull() ?: return base
+        return base.copy(
+            chart = chart,
+            matchKind = base.matchKind + "+hidden",
+            confidence = minOf(base.confidence, 0.98f)
+        )
+    }
+
     /** Packaging/data sanity checks. These do not claim that OCR itself is tuned yet. */
     fun sanityErrors(): List<String> = buildList {
         if (songCount < 500) add("Official song count unexpectedly low: $songCount")
@@ -151,7 +181,11 @@ class ArcaeaChartIndex private constructor(
                         constant = constant,
                         notes = notes,
                         variantTitle = chart.optNullableString("variant_title"),
-                        variantAliases = chart.optJSONArray("variant_title_aliases")?.stringList().orEmpty()
+                        variantAliases = chart.optJSONArray("variant_title_aliases")?.stringList().orEmpty(),
+                        hiddenUntilUnlocked = chart.optNullableBoolean("hidden_until_unlocked")
+                            ?: chart.optNullableBoolean("hiddenUntilUnlocked"),
+                        hiddenUntil = chart.optNullableString("hidden_until")
+                            ?: chart.optNullableString("hiddenUntil")
                     )
                 }
 
@@ -223,6 +257,19 @@ class ArcaeaChartIndex private constructor(
             if (!has(key) || isNull(key)) return null
             return optInt(key)
         }
+
+        private fun JSONObject.optNullableBoolean(key: String): Boolean? {
+            if (!has(key) || isNull(key)) return null
+            return when (val value = opt(key)) {
+                is Boolean -> value
+                is String -> when (value.trim().lowercase(Locale.ROOT)) {
+                    "true" -> true
+                    "false" -> false
+                    else -> null
+                }
+                else -> null
+            }
+        }
     }
 }
 
@@ -239,8 +286,28 @@ data class ArcaeaChartDefinition(
     val constant: Double?,
     val notes: Int?,
     val variantTitle: String?,
-    val variantAliases: List<String>
-)
+    val variantAliases: List<String>,
+    val hiddenUntilUnlocked: Boolean?,
+    val hiddenUntil: String?
+) {
+    /** null means the imported database does not contain songlist visibility metadata. */
+    fun hiddenBeforeUnlock(): Boolean? {
+        hiddenUntilUnlocked?.let { return it }
+        val condition = hiddenUntil?.trim()?.lowercase(Locale.ROOT) ?: return null
+        return when (condition) {
+            "none" -> false
+            "always", "difficulty", "song", "unlockconditions" -> true
+            else -> null
+        }
+    }
+
+    fun visibilityDescription(): String = when {
+        hiddenUntilUnlocked == true -> "hidden_until_unlocked"
+        hiddenUntilUnlocked == false -> "visible"
+        !hiddenUntil.isNullOrBlank() -> "hidden_until=${hiddenUntil}"
+        else -> "metadata unavailable"
+    }
+}
 
 data class ArcaeaTitleResolution(
     val song: ArcaeaSongDefinition,
