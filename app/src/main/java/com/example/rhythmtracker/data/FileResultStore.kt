@@ -5,11 +5,7 @@ import org.json.JSONObject
 import java.io.File
 import java.io.OutputStream
 
-/**
- * Append-only JSONL result store in private app storage.
- *
- * Results are explicitly exportable so a test build never traps useful data inside the app.
- */
+/** Append-only JSONL store. Partial OCR fields stay explicit nulls instead of being guessed. */
 class FileResultStore(context: Context) {
     private val file = File(context.filesDir, "results.jsonl")
 
@@ -21,8 +17,16 @@ class FileResultStore(context: Context) {
             .put("gameId", result.gameId)
             .put("songId", result.songId)
             .put("difficulty", result.difficulty)
+            .put("title", result.title)
+            .put("artist", result.artist)
+            .put("trackState", result.trackState)
             .put("score", result.score)
+            .put("pure", result.pure)
+            .put("far", result.far)
+            .put("lost", result.lost)
             .put("confidence", result.confidence.toDouble())
+            .put("screenshotPath", result.screenshotPath)
+            .put("rawOcr", result.rawOcr)
             .put("source", result.source)
 
         file.appendText(json.toString() + "\n", Charsets.UTF_8)
