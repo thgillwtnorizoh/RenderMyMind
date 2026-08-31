@@ -1,5 +1,6 @@
 package com.example.rhythmtracker.detection
 
+import com.example.rhythmtracker.game.arcaea.ArcaeaResultLayout
 import com.example.rhythmtracker.identity.ResultIdentity
 import com.example.rhythmtracker.identity.ResultIdentityMatcher
 import com.example.rhythmtracker.state.ResultSignal
@@ -12,6 +13,10 @@ import kotlin.math.abs
 /**
  * Converts raw OCR geometry into result-screen evidence. It deliberately does not own lifecycle,
  * duplicate suppression, capture timing, or persistence.
+ *
+ * Geometry is intentionally broad but layout-aware. Arcaea's result screen scales very
+ * consistently, so anchors must live in their expected viewport bands. OCR still runs at the
+ * captured bitmap's native resolution.
  */
 class ArcaeaResultDetector {
     data class Detection(
@@ -20,17 +25,27 @@ class ArcaeaResultDetector {
         val preview: String
     )
 
-    fun detect(lines: List<VisionLine>, visualHash: Long): Detection {
-        val resultLine = lines.firstOrNull(::looksLikeResultHeader)
-        val trackLine = lines.filter(::looksLikeTrackState)
+    fun detect(
+        lines: List<VisionLine>,
+        visualHash: Long,
+        stage: VisionStage = VisionStage.LIGHT
+    ): Detection {
+        val resultLine = lines
+            .filter(ArcaeaResultLayout::isHeaderBand)
+            .firstOrNull(::looksLikeResultHeader)
+        val trackLine = lines
+            .filter(ArcaeaResultLayout::isTrackBand)
+            .filter(::looksLikeTrackState)
             .maxByOrNull { it.bounds.width() * it.bounds.height() }
-        val maxRecall = lines.firstOrNull(::looksLikeMaxRecall)
+        val maxRecall = lines.firstOrNull { line ->
+            ArcaeaResultLayout.isTrackBand(line) && looksLikeMaxRecall(line)
+        }
         val scoreLine = chooseScoreLine(lines)
 
         val judgementLines = linkedMapOf<String, VisionLine>()
         JUDGEMENTS.forEach { token ->
             lines.firstOrNull { line ->
-                line.bounds.centerY() > line.frameHeight * 0.48f && containsAnchor(line.text, token)
+                ArcaeaResultLayout.isJudgementBand(line) && containsAnchor(line.text, token)
             }?.let { judgementLines[token] = it }
         }
 
@@ -70,10 +85,10 @@ class ArcaeaResultDetector {
         )
 
         val regions = buildList {
-            resultLine?.let { add(DebugRegion("result", it.normalizedBounds, VisionStage.LIGHT)) }
-            trackLine?.let { add(DebugRegion("track", it.normalizedBounds, VisionStage.LIGHT)) }
-            scoreLine?.let { add(DebugRegion("score", it.normalizedBounds, VisionStage.LIGHT)) }
-            judgementLines.values.forEach { add(DebugRegion("judgement", it.normalizedBounds, VisionStage.LIGHT)) }
+            resultLine?.let { add(DebugRegion("result", it.normalizedBounds, stage)) }
+            trackLine?.let { add(DebugRegion("track", it.normalizedBounds, stage)) }
+            scoreLine?.let { add(DebugRegion("score", it.normalizedBounds, stage)) }
+            judgementLines.values.forEach { add(DebugRegion("judgement", it.normalizedBounds, stage)) }
         }
 
         val preview = lines.sortedWith(compareBy<VisionLine> { it.bounds.top }.thenBy { it.bounds.left })
@@ -116,22 +131,20 @@ class ArcaeaResultDetector {
     ): String? {
         if (lines.isEmpty()) return null
         val frameHeight = lines.first().frameHeight
-        val frameWidth = lines.first().frameWidth
         val top = maxOf(
             (frameHeight * 0.055f).toInt(),
             resultLine?.bounds?.bottom?.plus((frameHeight * 0.006f).toInt()) ?: 0
         )
         val bottom = minOf(
-            (frameHeight * 0.36f).toInt(),
+            (frameHeight * 0.31f).toInt(),
             trackLine?.bounds?.top?.minus((frameHeight * 0.006f).toInt()) ?: Int.MAX_VALUE
         )
         if (bottom <= top) return null
 
         return lines.asSequence()
+            .filter(ArcaeaResultLayout::isTitleBand)
             .filter { line ->
                 line.bounds.centerY() in top..bottom &&
-                    line.bounds.centerX() > frameWidth * 0.08f &&
-                    line.bounds.centerX() < frameWidth * 0.92f &&
                     !looksLikeResultHeader(line) &&
                     !looksLikeTrackState(line) &&
                     !looksLikeMaxRecall(line) &&
@@ -143,13 +156,13 @@ class ArcaeaResultDetector {
     }
 
     private fun chooseScoreLine(lines: List<VisionLine>): VisionLine? = lines
+        .filter(ArcaeaResultLayout::isScoreBand)
         .filter { line ->
-            val y = line.bounds.centerY().toFloat() / line.frameHeight.coerceAtLeast(1)
-            y in 0.20f..0.72f && parseScore(line.text) != null &&
-                !normalize(line.text).contains("HIGH SCORE")
+            parseScore(line.text) != null && !normalize(line.text).contains("HIGH SCORE")
         }
         .maxWithOrNull(compareBy<VisionLine> { it.bounds.height() }.thenBy { it.bounds.width() })
 
+    /** Arcaea displays the result score as exactly eight digits, including leading zeroes. */
     fun parseScore(raw: String): Long? {
         val normalized = raw.asSequence()
             .map { char ->
@@ -162,7 +175,7 @@ class ArcaeaResultDetector {
             .filter { it.isDigit() }
             .joinToString("")
 
-        if (normalized.length !in 7..8) return null
+        if (normalized.length != 8) return null
         val value = normalized.toLongOrNull() ?: return null
         return value.takeIf { it in 0L..10_000_000L }
     }
@@ -187,11 +200,13 @@ class ArcaeaResultDetector {
     }
 
     private fun looksLikeResultHeader(line: VisionLine): Boolean {
+        val upper = line.text.uppercase(Locale.US)
+        if ("EXPORT" in upper || "RESULTS" in upper) return false
         val words = line.text.split(Regex("\\s+"))
         return words.any { word ->
             val compact = word.uppercase(Locale.US).filter { it.isLetterOrDigit() }
             compact == "RESULT" ||
-                (compact.length in 5..7 && levenshtein(compact, "RESULT", 1) <= 1)
+                (compact.length in 5..6 && levenshtein(compact, "RESULT", 1) <= 1)
         }
     }
 

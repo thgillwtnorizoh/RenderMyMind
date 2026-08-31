@@ -23,18 +23,19 @@ import com.example.rhythmtracker.data.FileResultStore
 import com.example.rhythmtracker.data.PlayResult
 import com.example.rhythmtracker.game.arcaea.ArcaeaChartIndex
 import com.example.rhythmtracker.game.arcaea.ArcaeaDatabaseStore
+import com.example.rhythmtracker.inspection.ResultInspectionActivity
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
 class MainActivity : Activity() {
-
     private lateinit var projectionManager: MediaProjectionManager
     private lateinit var statusText: TextView
     private lateinit var visionOverlaySwitch: Switch
     private lateinit var diagnosticStore: DiagnosticStore
     private lateinit var resultStore: FileResultStore
     private lateinit var databaseStore: ArcaeaDatabaseStore
+
     private var persistedSnapshot: DiagnosticSnapshot? = null
 
     @Volatile
@@ -65,10 +66,24 @@ class MainActivity : Activity() {
         visionOverlaySwitch = findViewById(R.id.visionOverlaySwitch)
 
         configureVisionOverlaySwitch()
+        configureButtons()
+        refreshDatabaseStatus()
+    }
 
-        findViewById<Button>(R.id.startButton).setOnClickListener {
-            beginTrackingFlow()
-        }
+    override fun onResume() {
+        super.onResume()
+        resolveOverlayPermissionReturn()
+        persistedSnapshot = diagnosticStore.readSnapshot()
+        uiHandler.post(refreshRunnable)
+    }
+
+    override fun onPause() {
+        uiHandler.removeCallbacks(refreshRunnable)
+        super.onPause()
+    }
+
+    private fun configureButtons() {
+        findViewById<Button>(R.id.startButton).setOnClickListener { beginTrackingFlow() }
 
         findViewById<Button>(R.id.stopButton).setOnClickListener {
             VisionDebugOverlay.stop()
@@ -81,6 +96,10 @@ class MainActivity : Activity() {
             requestDatabaseImport()
         }
 
+        findViewById<Button>(R.id.inspectImagesButton).setOnClickListener {
+            startActivity(Intent(this, ResultInspectionActivity::class.java))
+        }
+
         findViewById<Button>(R.id.exportResultsButton).setOnClickListener {
             requestResultsExport()
         }
@@ -90,39 +109,10 @@ class MainActivity : Activity() {
         }
 
         findViewById<Button>(R.id.testRecordButton).setOnClickListener {
-            val result = PlayResult.manualTest()
-            resultStore.append(result)
+            resultStore.append(PlayResult.manualTest())
             TrackerRuntime.savedResults += 1
             TrackerRuntime.lastMessage = "Manual test result appended to results.jsonl"
         }
-
-        refreshDatabaseStatus()
-    }
-
-    override fun onResume() {
-        super.onResume()
-
-        if (pendingOverlayEnable) {
-            pendingOverlayEnable = false
-            val granted = Settings.canDrawOverlays(this)
-            setVisionOverlayEnabled(granted)
-            TrackerRuntime.lastMessage = if (granted) {
-                "Vision overlay enabled; it will appear while tracking"
-            } else {
-                "Vision overlay permission was not granted"
-            }
-        } else if (visionOverlayPreference() && !Settings.canDrawOverlays(this)) {
-            // Permission may have been revoked in Android settings while the app was away.
-            setVisionOverlayEnabled(false)
-        }
-
-        persistedSnapshot = diagnosticStore.readSnapshot()
-        uiHandler.post(refreshRunnable)
-    }
-
-    override fun onPause() {
-        uiHandler.removeCallbacks(refreshRunnable)
-        super.onPause()
     }
 
     private fun configureVisionOverlaySwitch() {
@@ -162,6 +152,24 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun resolveOverlayPermissionReturn() {
+        if (pendingOverlayEnable) {
+            pendingOverlayEnable = false
+            val granted = Settings.canDrawOverlays(this)
+            setVisionOverlayEnabled(granted)
+            TrackerRuntime.lastMessage = if (granted) {
+                "Vision overlay enabled; it will appear while tracking"
+            } else {
+                "Vision overlay permission was not granted"
+            }
+            return
+        }
+
+        if (visionOverlayPreference() && !Settings.canDrawOverlays(this)) {
+            setVisionOverlayEnabled(false)
+        }
+    }
+
     private fun beginTrackingFlow() {
         if (TrackerRuntime.active) {
             TrackerRuntime.lastMessage = "Tracking is already active"
@@ -178,10 +186,7 @@ class MainActivity : Activity() {
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
             pendingCaptureStart = true
-            requestPermissions(
-                arrayOf(Manifest.permission.POST_NOTIFICATIONS),
-                REQUEST_NOTIFICATIONS
-            )
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_NOTIFICATIONS)
             return
         }
 
@@ -200,21 +205,25 @@ class MainActivity : Activity() {
     }
 
     private fun requestDatabaseImport() {
-        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-            addCategory(Intent.CATEGORY_OPENABLE)
-            type = "application/json"
-        }
-        startActivityForResult(intent, REQUEST_IMPORT_DATABASE)
+        startActivityForResult(
+            Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "application/json"
+            },
+            REQUEST_IMPORT_DATABASE
+        )
     }
 
     private fun requestResultsExport() {
         val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
-        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
-            addCategory(Intent.CATEGORY_OPENABLE)
-            type = "application/json"
-            putExtra(Intent.EXTRA_TITLE, "RenderMyMind-results-$stamp.jsonl")
-        }
-        startActivityForResult(intent, REQUEST_EXPORT_RESULTS)
+        startActivityForResult(
+            Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "application/json"
+                putExtra(Intent.EXTRA_TITLE, "RenderMyMind-results-$stamp.jsonl")
+            },
+            REQUEST_EXPORT_RESULTS
+        )
     }
 
     private fun requestDiagnosticsExport() {
@@ -225,18 +234,19 @@ class MainActivity : Activity() {
         }
 
         val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
-        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
-            addCategory(Intent.CATEGORY_OPENABLE)
-            type = "application/json"
-            putExtra(Intent.EXTRA_TITLE, "RenderMyMind-diagnostics-$stamp.jsonl")
-        }
-        startActivityForResult(intent, REQUEST_EXPORT_DIAGNOSTICS)
+        startActivityForResult(
+            Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "application/json"
+                putExtra(Intent.EXTRA_TITLE, "RenderMyMind-diagnostics-$stamp.jsonl")
+            },
+            REQUEST_EXPORT_DIAGNOSTICS
+        )
     }
 
-    @Deprecated("Prototype uses the small, dependency-free Activity result API on purpose.")
+    @Deprecated("Alpha UI keeps the small dependency-free Activity result API.")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-
         when (requestCode) {
             REQUEST_CAPTURE -> handleCaptureResult(resultCode, data)
             REQUEST_IMPORT_DATABASE -> handleDatabaseImport(resultCode, data?.data)
@@ -252,17 +262,15 @@ class MainActivity : Activity() {
             return
         }
 
-        val serviceIntent = Intent(this, CaptureService::class.java).apply {
+        startForegroundService(Intent(this, CaptureService::class.java).apply {
             action = CaptureService.ACTION_START
             putExtra(CaptureService.EXTRA_RESULT_CODE, resultCode)
             putExtra(CaptureService.EXTRA_RESULT_DATA, data)
-        }
-        startForegroundService(serviceIntent)
+        })
 
         if (visionOverlayPreference() && Settings.canDrawOverlays(this)) {
             VisionDebugOverlay.start(applicationContext)
         }
-
         TrackerRuntime.lastMessage = "Starting RenderMyMind Alpha projection service…"
     }
 
@@ -275,9 +283,8 @@ class MainActivity : Activity() {
 
         Thread {
             val outcome = runCatching {
-                val input = contentResolver.openInputStream(uri)
+                contentResolver.openInputStream(uri)?.use(databaseStore::importFrom)
                     ?: error("Android returned no readable input stream")
-                databaseStore.importFrom(input)
             }
 
             runOnUiThread {
@@ -297,30 +304,26 @@ class MainActivity : Activity() {
 
     private fun handleResultsExport(resultCode: Int, uri: Uri?) {
         if (resultCode != RESULT_OK || uri == null) return
-
-        try {
-            contentResolver.openOutputStream(uri, "w")?.use { output ->
-                resultStore.exportTo(output)
-            } ?: error("Android returned no writable output stream")
-            TrackerRuntime.lastMessage = "Results exported successfully"
-        } catch (error: Throwable) {
-            TrackerRuntime.lastMessage =
-                "Results export failed: ${error.message ?: error.javaClass.simpleName}"
+        val outcome = runCatching {
+            contentResolver.openOutputStream(uri, "w")?.use(resultStore::exportTo)
+                ?: error("Android returned no writable output stream")
         }
+        TrackerRuntime.lastMessage = outcome.fold(
+            onSuccess = { "Results exported successfully" },
+            onFailure = { "Results export failed: ${it.message ?: it.javaClass.simpleName}" }
+        )
     }
 
     private fun handleDiagnosticsExport(resultCode: Int, uri: Uri?) {
         if (resultCode != RESULT_OK || uri == null) return
-
-        try {
-            contentResolver.openOutputStream(uri, "w")?.use { output ->
-                diagnosticStore.exportTo(output)
-            } ?: error("Android returned no writable output stream")
-            TrackerRuntime.lastMessage = "Diagnostics exported successfully"
-        } catch (error: Throwable) {
-            TrackerRuntime.lastMessage =
-                "Diagnostics export failed: ${error.message ?: error.javaClass.simpleName}"
+        val outcome = runCatching {
+            contentResolver.openOutputStream(uri, "w")?.use(diagnosticStore::exportTo)
+                ?: error("Android returned no writable output stream")
         }
+        TrackerRuntime.lastMessage = outcome.fold(
+            onSuccess = { "Diagnostics exported successfully" },
+            onFailure = { "Diagnostics export failed: ${it.message ?: it.javaClass.simpleName}" }
+        )
     }
 
     override fun onRequestPermissionsResult(
@@ -344,9 +347,7 @@ class MainActivity : Activity() {
         databaseStatus = "loading…"
         Thread {
             val status = runCatching { databaseStatus(databaseStore.load()) }
-                .getOrElse { error ->
-                    "invalid: ${error.message ?: error.javaClass.simpleName}"
-                }
+                .getOrElse { "invalid: ${it.message ?: it.javaClass.simpleName}" }
             runOnUiThread {
                 databaseStatus = status
                 renderRuntimeState()
@@ -358,51 +359,42 @@ class MainActivity : Activity() {
         "${index.songCount} songs / ${index.chartCount} charts / ${index.knownConstantCount} CC"
 
     private fun renderRuntimeState() {
-        if (TrackerRuntime.active) {
-            statusText.text = liveRuntimeText()
-            return
-        }
-
-        val saved = persistedSnapshot ?: diagnosticStore.readSnapshot().also {
-            persistedSnapshot = it
-        }
-
-        statusText.text = if (saved != null) {
-            persistedSnapshotText(saved)
+        statusText.text = if (TrackerRuntime.active) {
+            liveRuntimeText()
         } else {
-            buildString {
-                appendLine("ARCAEA DATABASE")
-                appendLine("database         : $databaseStatus")
-                appendLine("vision overlay   : ${visionOverlayStatus()}")
-                appendLine("results JSONL    : ${resultStore.sizeBytes()} bytes")
-                appendLine()
-                append("No persisted tracking session yet.\n\nStart tracking to create diagnostics.")
-            }
+            val saved = persistedSnapshot ?: diagnosticStore.readSnapshot().also { persistedSnapshot = it }
+            saved?.let(::persistedSnapshotText) ?: idleText()
         }
     }
 
-    private fun liveRuntimeText(): String {
-        val sampleTime = formatTime(TrackerRuntime.lastSampleAtMs)
-        return buildString {
-            appendLine("LIVE SESSION")
-            appendLine("database         : $databaseStatus")
-            appendLine("vision overlay   : ${visionOverlayStatus()}")
-            appendLine("session          : ${TrackerRuntime.sessionId}")
-            appendLine("tracking         : ${TrackerRuntime.active}")
-            appendLine("capture mode     : ${TrackerRuntime.captureSize}")
-            appendLine("frames pulled    : ${TrackerRuntime.sampledFrames}")
-            appendLine("OCR probes       : ${TrackerRuntime.ocrProbes}")
-            appendLine("OCR result hits  : ${TrackerRuntime.ocrHits}")
-            appendLine("OCR last / avg   : ${TrackerRuntime.lastOcrDurationMs} / ${TrackerRuntime.averageOcrDurationMs} ms")
-            appendLine("OCR max          : ${TrackerRuntime.maxOcrDurationMs} ms")
-            appendLine("screens captured : ${TrackerRuntime.capturedScreens}")
-            appendLine("saved results    : ${TrackerRuntime.savedResults}")
-            appendLine("last sample      : $sampleTime")
-            appendLine("last OCR text    : ${TrackerRuntime.lastOcrText}")
-            appendLine("last PNG         : ${TrackerRuntime.lastCapturePath}")
-            appendLine()
-            append(TrackerRuntime.lastMessage)
-        }
+    private fun idleText(): String = buildString {
+        appendLine("ARCAEA DATABASE")
+        appendLine("database         : $databaseStatus")
+        appendLine("vision overlay   : ${visionOverlayStatus()}")
+        appendLine("results JSONL    : ${resultStore.sizeBytes()} bytes")
+        appendLine()
+        append("No persisted tracking session yet.\n\nStart tracking to create diagnostics.")
+    }
+
+    private fun liveRuntimeText(): String = buildString {
+        appendLine("LIVE SESSION")
+        appendLine("database         : $databaseStatus")
+        appendLine("vision overlay   : ${visionOverlayStatus()}")
+        appendLine("session          : ${TrackerRuntime.sessionId}")
+        appendLine("tracking         : ${TrackerRuntime.active}")
+        appendLine("capture mode     : ${TrackerRuntime.captureSize}")
+        appendLine("frames pulled    : ${TrackerRuntime.sampledFrames}")
+        appendLine("OCR probes       : ${TrackerRuntime.ocrProbes}")
+        appendLine("OCR result hits  : ${TrackerRuntime.ocrHits}")
+        appendLine("OCR last / avg   : ${TrackerRuntime.lastOcrDurationMs} / ${TrackerRuntime.averageOcrDurationMs} ms")
+        appendLine("OCR max          : ${TrackerRuntime.maxOcrDurationMs} ms")
+        appendLine("screens captured : ${TrackerRuntime.capturedScreens}")
+        appendLine("saved results    : ${TrackerRuntime.savedResults}")
+        appendLine("last sample      : ${formatTime(TrackerRuntime.lastSampleAtMs)}")
+        appendLine("last OCR text    : ${TrackerRuntime.lastOcrText}")
+        appendLine("last PNG         : ${TrackerRuntime.lastCapturePath}")
+        appendLine()
+        append(TrackerRuntime.lastMessage)
     }
 
     private fun persistedSnapshotText(snapshot: DiagnosticSnapshot): String = buildString {

@@ -1,6 +1,7 @@
 package com.example.rhythmtracker.parser
 
 import com.example.rhythmtracker.detection.ArcaeaResultDetector
+import com.example.rhythmtracker.game.arcaea.ArcaeaResultLayout
 import com.example.rhythmtracker.vision.DebugRegion
 import com.example.rhythmtracker.vision.VisionLine
 import com.example.rhythmtracker.vision.VisionStage
@@ -28,7 +29,9 @@ class ArcaeaResultParser(
             return Parsed(null, null, null, null, null, null, null, 0f, emptyList(), "")
         }
 
-        val trackLine = lines.filter(detector::looksLikeTrackState)
+        val trackLine = lines
+            .filter(ArcaeaResultLayout::isTrackBand)
+            .filter(detector::looksLikeTrackState)
             .maxByOrNull { it.bounds.width() * it.bounds.height() }
         val scoreLine = chooseScoreLine(lines)
         val titleLine = chooseTitleLine(lines, trackLine)
@@ -83,23 +86,19 @@ class ArcaeaResultParser(
     }
 
     private fun chooseScoreLine(lines: List<VisionLine>): VisionLine? = lines
+        .filter(ArcaeaResultLayout::isScoreBand)
         .filter { line ->
-            val y = line.bounds.centerY().toFloat() / line.frameHeight.coerceAtLeast(1)
-            y in 0.20f..0.72f && detector.parseScore(line.text) != null &&
-                !line.text.uppercase().contains("HIGH SCORE")
+            detector.parseScore(line.text) != null && !line.text.uppercase().contains("HIGH SCORE")
         }
         .maxWithOrNull(compareBy<VisionLine> { it.bounds.height() }.thenBy { it.bounds.width() })
 
     private fun chooseTitleLine(lines: List<VisionLine>, trackLine: VisionLine?): VisionLine? {
         val frameHeight = lines.first().frameHeight
-        val frameWidth = lines.first().frameWidth
-        val trackTop = trackLine?.bounds?.top ?: (frameHeight * 0.39f).toInt()
+        val trackTop = trackLine?.bounds?.top ?: (frameHeight * 0.40f).toInt()
         return lines.asSequence()
+            .filter(ArcaeaResultLayout::isTitleBand)
             .filter { line ->
-                val y = line.bounds.centerY()
-                y > frameHeight * 0.055f && y < trackTop &&
-                    line.bounds.centerX() > frameWidth * 0.07f &&
-                    line.bounds.centerX() < frameWidth * 0.93f &&
+                line.bounds.centerY() < trackTop &&
                     detector.parseScore(line.text) == null &&
                     !detector.looksLikeTrackState(line) &&
                     !isChrome(line.text)
@@ -116,6 +115,7 @@ class ArcaeaResultParser(
         val frameHeight = titleLine.frameHeight
         val trackTop = trackLine?.bounds?.top ?: (frameHeight * 0.40f).toInt()
         return lines.asSequence()
+            .filter(ArcaeaResultLayout::isTitleBand)
             .filter { line ->
                 line !== titleLine &&
                     line.bounds.centerY() >= titleLine.bounds.bottom &&
@@ -129,13 +129,14 @@ class ArcaeaResultParser(
 
     private fun judgement(lines: List<VisionLine>, token: String): Pair<VisionLine?, Int?> {
         val label = lines.firstOrNull { line ->
-            line.bounds.centerY() > line.frameHeight * 0.48f && containsToken(line.text, token)
+            ArcaeaResultLayout.isJudgementBand(line) && containsToken(line.text, token)
         } ?: return null to null
 
         parseSmallNumber(label.text.replace(token, "", ignoreCase = true))?.let { return label to it }
 
         val tolerance = label.frameHeight * 0.035f
         val nearby = lines.asSequence()
+            .filter(ArcaeaResultLayout::isJudgementBand)
             .filter { candidate ->
                 candidate !== label &&
                     abs(candidate.bounds.centerY() - label.bounds.centerY()) <= tolerance &&
