@@ -18,8 +18,8 @@ object ArcaeaResultLayout {
     fun isHeaderBand(line: VisionLine): Boolean {
         val w = line.frameWidth.toFloat().coerceAtLeast(1f)
         val h = line.frameHeight.toFloat().coerceAtLeast(1f)
-        val cx = line.bounds.centerX()
-        val cy = line.bounds.centerY()
+        val cx = line.bounds.centerX().toFloat()
+        val cy = line.bounds.centerY().toFloat()
         return cx <= w * 0.22f &&
             cy <= h * 0.12f &&
             line.bounds.height() >= widthScaledPixels(line.frameWidth, 9f)
@@ -28,8 +28,8 @@ object ArcaeaResultLayout {
     fun isTitleBand(line: VisionLine): Boolean {
         val w = line.frameWidth.toFloat().coerceAtLeast(1f)
         val h = line.frameHeight.toFloat().coerceAtLeast(1f)
-        val cx = line.bounds.centerX()
-        val cy = line.bounds.centerY()
+        val cx = line.bounds.centerX().toFloat()
+        val cy = line.bounds.centerY().toFloat()
         return cx in (w * 0.16f)..(w * 0.84f) &&
             cy in (h * 0.055f)..(h * 0.31f) &&
             line.bounds.height() >= widthScaledPixels(line.frameWidth, 8f)
@@ -38,8 +38,8 @@ object ArcaeaResultLayout {
     fun isTrackBand(line: VisionLine): Boolean {
         val w = line.frameWidth.toFloat().coerceAtLeast(1f)
         val h = line.frameHeight.toFloat().coerceAtLeast(1f)
-        val cx = line.bounds.centerX()
-        val cy = line.bounds.centerY()
+        val cx = line.bounds.centerX().toFloat()
+        val cy = line.bounds.centerY().toFloat()
         return cx in (w * 0.20f)..(w * 0.82f) &&
             cy in (h * 0.16f)..(h * 0.46f) &&
             line.bounds.height() >= widthScaledPixels(line.frameWidth, 12f)
@@ -48,8 +48,8 @@ object ArcaeaResultLayout {
     fun isScoreBand(line: VisionLine): Boolean {
         val w = line.frameWidth.toFloat().coerceAtLeast(1f)
         val h = line.frameHeight.toFloat().coerceAtLeast(1f)
-        val cx = line.bounds.centerX()
-        val cy = line.bounds.centerY()
+        val cx = line.bounds.centerX().toFloat()
+        val cy = line.bounds.centerY().toFloat()
         return cx in (w * 0.29f)..(w * 0.76f) &&
             cy in (h * 0.27f)..(h * 0.62f) &&
             line.bounds.height() >= widthScaledPixels(line.frameWidth, 12f)
@@ -58,8 +58,8 @@ object ArcaeaResultLayout {
     fun isJudgementBand(line: VisionLine): Boolean {
         val w = line.frameWidth.toFloat().coerceAtLeast(1f)
         val h = line.frameHeight.toFloat().coerceAtLeast(1f)
-        val cx = line.bounds.centerX()
-        val cy = line.bounds.centerY()
+        val cx = line.bounds.centerX().toFloat()
+        val cy = line.bounds.centerY().toFloat()
         return cx in (w * 0.34f)..(w * 0.66f) &&
             cy in (h * 0.47f)..(h * 0.90f) &&
             line.bounds.height() >= widthScaledPixels(line.frameWidth, 7f)
