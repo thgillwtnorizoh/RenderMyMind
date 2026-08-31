@@ -235,9 +235,10 @@ private class VisionDebugView(context: Context) : View(context) {
         super.onDraw(canvas)
         if (width <= 0 || height <= 0) return
 
-        // Debug mode should be visually silent during gameplay/menus. The overlay appears only
-        // while the live Result tripwire is present.
-        if (!snapshot.resultLike) return
+        // Stay invisible during the cheap tripwire pass so the overlay itself cannot be captured
+        // into the native evidence frame. Boxes appear only after native OCR has finished, and only
+        // while the Result tripwire continues to say the result screen is live.
+        if (!snapshot.resultLike || snapshot.pass != OcrPass.NATIVE) return
 
         drawGateStatus(canvas)
 
@@ -253,8 +254,7 @@ private class VisionDebugView(context: Context) : View(context) {
             )
 
             borderPaint.color = when {
-                snapshot.pass == OcrPass.NATIVE -> Color.rgb(179, 122, 255)
-                reading.text.isNotBlank() -> Color.rgb(103, 230, 151)
+                reading.text.isNotBlank() -> Color.rgb(179, 122, 255)
                 else -> Color.rgb(255, 200, 92)
             }
             canvas.drawRect(roi, borderPaint)
@@ -264,7 +264,7 @@ private class VisionDebugView(context: Context) : View(context) {
 
     private fun drawGateStatus(canvas: Canvas) {
         val anchors = snapshot.matchedAnchors.joinToString(", ").ifBlank { "result" }
-        val text = "VISION ${snapshot.pass}: RESULT LIVE  |  anchors: $anchors"
+        val text = "VISION NATIVE: RESULT LIVE  |  anchors: $anchors"
         val padding = 6f * density
         val maxWidth = width * 0.32f - padding * 2
         val fitted = fitText(text, statusTextPaint, maxWidth)
