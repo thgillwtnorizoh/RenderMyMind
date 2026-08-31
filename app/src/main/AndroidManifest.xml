@@ -8,7 +8,7 @@
 
     <application
         android:allowBackup="true"
-        android:label="Rhythm Tracker Prototype"
+        android:label="RenderMyMind Alpha"
         android:supportsRtl="true"
         android:theme="@style/Theme.RhythmTracker">
 

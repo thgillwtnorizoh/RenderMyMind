@@ -14,7 +14,7 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="RenderMyMind Alpha // v0.3.1"
+            android:text="RenderMyMind Alpha // v0.4.0"
             android:textColor="#FFFFFF"
             android:textSize="24sp"
             android:textStyle="bold" />
@@ -23,7 +23,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
-            android:text="Arcaea adapter foundation: import the merged cheeseburger database, run the low-cost Arcaea result gate, and keep both diagnostics and result JSONL exportable."
+            android:text="Clean v2 result pipeline: lightweight detection, tolerant result identity, native-resolution multilingual parsing, and one canonical saved result per accepted play."
             android:textColor="#B8BBC2"
             android:textSize="15sp" />
 
@@ -102,7 +102,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="16dp"
-            android:text="The imported database is validated before replacing the previous copy. Missing chart constants stay missing; the tracker must never invent CC. The vision overlay is a tuning tool and is off by default."
+            android:text="The imported database is validated before replacing the previous copy. Missing chart constants stay missing. Debug rendering is read-only: it shows thin detection geometry but never participates in OCR, identity, or capture decisions."
             android:textColor="#8E929B"
             android:textSize="13sp" />
 
