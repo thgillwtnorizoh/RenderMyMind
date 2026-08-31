@@ -37,7 +37,7 @@ object VisionDebugState {
             matchedAnchors = emptySet(),
             textPreview = "",
             regionReadings = OcrProbeRegion.ALL.map {
-                OcrRegionReading(it.key, it.label, "")
+                OcrRegionReading(it.key, it.label, "", null)
             },
             pass = OcrPass.LIGHT,
             error = null
@@ -49,14 +49,23 @@ object VisionDebugState {
 
         while (true) {
             val previous = latest.get()
-            // Once we have paid for a native-resolution OCR pass, keep those useful readings on
-            // screen for a few seconds. The next 480 px probe must not instantly overwrite them
-            // with the blurry text that caused this debugging feature in the first place.
+
+            // Keep useful native semantic boxes while the cheap tripwire still confirms that the
+            // result screen is live. The very first miss replaces this snapshot immediately, so
+            // debug boxes never linger over gameplay or menus.
             if (result.pass == OcrPass.LIGHT &&
+                result.isResultLike &&
                 previous.pass == OcrPass.NATIVE &&
+                previous.resultLike &&
                 now - previous.updatedAtMs < NATIVE_HOLD_MS
             ) {
-                return
+                val kept = previous.copy(
+                    updatedAtMs = now,
+                    matchedAnchors = result.matchedKeywords.toSet(),
+                    error = result.error
+                )
+                if (latest.compareAndSet(previous, kept)) return
+                continue
             }
 
             val next = VisionDebugSnapshot(
@@ -75,13 +84,7 @@ object VisionDebugState {
     fun snapshot(): VisionDebugSnapshot = latest.get()
 }
 
-/**
- * Optional TYPE_APPLICATION_OVERLAY debugger.
- *
- * Every rectangle is a real OCR crop. The left-side panels show what ML Kit actually returned.
- * The overlay can be hidden for the brief native capture so its own borders/text do not pollute
- * the high-quality evidence frame.
- */
+/** Optional TYPE_APPLICATION_OVERLAY debugger. */
 object VisionDebugOverlay {
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -232,45 +235,41 @@ private class VisionDebugView(context: Context) : View(context) {
         super.onDraw(canvas)
         if (width <= 0 || height <= 0) return
 
+        // Stay invisible during the cheap tripwire pass so the overlay itself cannot be captured
+        // into the native evidence frame. Boxes appear only after native OCR has finished, and only
+        // while the Result tripwire continues to say the result screen is live.
+        if (!snapshot.resultLike || snapshot.pass != OcrPass.NATIVE) return
+
         drawGateStatus(canvas)
 
         val readings = snapshot.regionReadings.associateBy { it.key }
         OcrProbeRegion.ALL.forEach { region ->
+            val reading = readings[region.key] ?: return@forEach
+            val bounds = reading.bounds ?: return@forEach
             val roi = RectF(
-                width * region.left,
-                height * region.top,
-                width * region.right,
-                height * region.bottom
+                width * bounds.left,
+                height * bounds.top,
+                width * bounds.right,
+                height * bounds.bottom
             )
-            val reading = readings[region.key]?.text.orEmpty()
 
             borderPaint.color = when {
-                snapshot.pass == OcrPass.NATIVE -> Color.rgb(179, 122, 255)
-                snapshot.resultLike -> Color.rgb(103, 230, 151)
-                reading.isNotBlank() -> Color.rgb(255, 200, 92)
-                else -> Color.rgb(103, 190, 255)
+                reading.text.isNotBlank() -> Color.rgb(179, 122, 255)
+                else -> Color.rgb(255, 200, 92)
             }
             canvas.drawRect(roi, borderPaint)
-            drawRegionReadout(canvas, region, roi, reading)
+            drawRegionReadout(canvas, region, roi, reading.text)
         }
     }
 
     private fun drawGateStatus(canvas: Canvas) {
-        val state = when {
-            snapshot.error != null -> "OCR ERROR"
-            snapshot.resultLike -> "RESULT-LIKE"
-            snapshot.updatedAtMs == 0L -> "WAITING"
-            System.currentTimeMillis() - snapshot.updatedAtMs > STALE_AFTER_MS -> "STALE"
-            else -> "SCANNING"
-        }
-
-        val anchors = snapshot.matchedAnchors.joinToString(", ").ifBlank { "none" }
-        val text = "VISION ${snapshot.pass}: $state  |  anchors: $anchors"
+        val anchors = snapshot.matchedAnchors.joinToString(", ").ifBlank { "result" }
+        val text = "VISION NATIVE: RESULT LIVE  |  anchors: $anchors"
         val padding = 6f * density
-        val maxWidth = width * 0.27f - padding * 2
+        val maxWidth = width * 0.32f - padding * 2
         val fitted = fitText(text, statusTextPaint, maxWidth)
         val h = statusTextPaint.fontMetrics.run { bottom - top } + padding * 2
-        val box = RectF(padding, padding, width * 0.27f, padding + h)
+        val box = RectF(padding, padding, width * 0.32f, padding + h)
         canvas.drawRoundRect(box, 5f * density, 5f * density, labelBackgroundPaint)
         val baseline = box.top + padding - statusTextPaint.fontMetrics.top
         canvas.drawText(fitted, box.left + padding, baseline, statusTextPaint)
@@ -314,9 +313,5 @@ private class VisionDebugView(context: Context) : View(context) {
         val available = (maxWidth - paint.measureText("…")).coerceAtLeast(0f)
         val count = paint.breakText(text, true, available, null).coerceAtLeast(0)
         return text.take(count).trimEnd() + "…"
-    }
-
-    companion object {
-        private const val STALE_AFTER_MS = 2_500L
     }
 }
