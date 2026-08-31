@@ -151,13 +151,16 @@ class ArcaeaResultDetector {
         .maxWithOrNull(compareBy<VisionLine> { it.bounds.height() }.thenBy { it.bounds.width() })
 
     fun parseScore(raw: String): Long? {
-        val normalized = raw.map { char ->
-            when (char) {
-                'O', 'o' -> '0'
-                'I', 'l', '|' -> '1'
-                else -> char
+        val normalized = raw.asSequence()
+            .map { char ->
+                when (char) {
+                    'O', 'o' -> '0'
+                    'I', 'l', '|' -> '1'
+                    else -> char
+                }
             }
-        }.filter { it.isDigit() }
+            .filter { it.isDigit() }
+            .joinToString("")
 
         if (normalized.length !in 7..8) return null
         val value = normalized.toLongOrNull() ?: return null
