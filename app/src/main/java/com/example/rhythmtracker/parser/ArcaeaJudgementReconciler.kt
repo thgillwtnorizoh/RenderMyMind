@@ -242,18 +242,20 @@ object ArcaeaJudgementReconciler {
             val maxDx = label.frameWidth * 0.16f
             val minDx = -label.frameWidth * 0.015f
             val maxDy = label.frameHeight * 0.022f
+            val frameWidth = label.frameWidth.coerceAtLeast(1).toFloat()
+            val frameHeight = label.frameHeight.coerceAtLeast(1).toFloat()
             lines.asSequence()
                 .filter(ArcaeaResultLayout::isJudgementBand)
                 .filter { it !== label }
                 .mapNotNull { candidate ->
-                    val dx = candidate.bounds.left - label.bounds.right
-                    val dy = abs(candidate.bounds.centerY() - label.bounds.centerY())
+                    val dx = (candidate.bounds.left - label.bounds.right).toFloat()
+                    val dy = abs(candidate.bounds.centerY() - label.bounds.centerY()).toFloat()
                     if (dx !in minDx..maxDx || dy > maxDy) return@mapNotNull null
                     val value = firstNumber(candidate.text)?.takeIf { it in 0..noteCount }
                         ?: return@mapNotNull null
                     val geometryCost = 0.08f +
-                        (abs(dx) / label.frameWidth.coerceAtLeast(1)) * 2.2f +
-                        (dy / label.frameHeight.coerceAtLeast(1)) * 2.8f
+                        (abs(dx) / frameWidth) * 2.2f +
+                        (dy / frameHeight) * 2.8f
                     Candidate(value, geometryCost, "ocr-near-label")
                 }
                 .sortedBy { it.cost }
