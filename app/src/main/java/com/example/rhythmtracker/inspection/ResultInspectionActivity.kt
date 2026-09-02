@@ -15,32 +15,36 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import com.example.rhythmtracker.R
 import com.example.rhythmtracker.detection.ArcaeaResultDetector
-import com.example.rhythmtracker.game.arcaea.ArcaeaChartIndex
 import com.example.rhythmtracker.game.arcaea.ArcaeaChartMarker
 import com.example.rhythmtracker.game.arcaea.ArcaeaDatabaseStore
 import com.example.rhythmtracker.identity.VisualFingerprint
+import com.example.rhythmtracker.parser.ArcaeaJudgementReconciler
 import com.example.rhythmtracker.parser.ArcaeaResultParser
 import com.example.rhythmtracker.vision.DebugRegion
 import com.example.rhythmtracker.vision.MlKitOcrEngine
 import com.example.rhythmtracker.vision.VisionStage
+import java.util.Collections
 import java.util.concurrent.Executors
 import kotlin.math.min
 
 /**
  * Offline inspection path for screenshots selected by the user.
  *
- * It intentionally reuses the live native OCR + detector + parser instead of maintaining a
- * second interpretation engine. Imported screenshots are never written to results.jsonl.
+ * Every image pass is intentionally fresh: the original URI is decoded again, the database is
+ * loaded again, and new detector/parser/OCR instances are created. Previous OCR text, parsed
+ * fields, candidate choices and confidence values are never fed into a later pass. Imported
+ * screenshots are never written to results.jsonl.
  */
 class ResultInspectionActivity : Activity() {
     private lateinit var progressText: TextView
     private lateinit var resultsContainer: LinearLayout
+    private lateinit var repeatAllButton: Button
 
     private val analysisExecutor = Executors.newSingleThreadExecutor()
-    private val ocrEngine = MlKitOcrEngine()
-    private val detector = ArcaeaResultDetector()
-    private val parser = ArcaeaResultParser(detector)
-    private var chartIndex: ArcaeaChartIndex? = null
+    private val activeOcrEngines = Collections.synchronizedSet(mutableSetOf<MlKitOcrEngine>())
+    private var selectedUris: List<Uri> = emptyList()
+    private var batchSerial = 0L
+    private var activeBatchGeneration = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -48,19 +52,24 @@ class ResultInspectionActivity : Activity() {
 
         progressText = findViewById(R.id.inspectionProgressText)
         resultsContainer = findViewById(R.id.inspectionResultsContainer)
+        repeatAllButton = findViewById(R.id.repeatInspectionImagesButton)
+        repeatAllButton.isEnabled = false
 
         findViewById<Button>(R.id.addInspectionImagesButton).setOnClickListener {
             requestImages()
         }
-
-        analysisExecutor.execute {
-            val store = ArcaeaDatabaseStore(this)
-            chartIndex = if (store.exists()) runCatching { store.load() }.getOrNull() else null
+        repeatAllButton.setOnClickListener {
+            if (selectedUris.isNotEmpty()) {
+                startFreshBatch(selectedUris, clearResults = false)
+            }
         }
     }
 
     override fun onDestroy() {
-        ocrEngine.close()
+        synchronized(activeOcrEngines) {
+            activeOcrEngines.toList().forEach { runCatching { it.close() } }
+            activeOcrEngines.clear()
+        }
         analysisExecutor.shutdownNow()
         super.onDestroy()
     }
@@ -79,39 +88,72 @@ class ResultInspectionActivity : Activity() {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode != REQUEST_IMAGES || resultCode != RESULT_OK || data == null) return
 
-        val uris = buildList {
-            data.clipData?.let { clip ->
+        val uris = if (data.clipData != null) {
+            buildList {
+                val clip = data.clipData!!
                 for (index in 0 until clip.itemCount) add(clip.getItemAt(index).uri)
             }
-            data.data?.let { if (it !in this) add(it) }
+        } else {
+            data.data?.let(::listOf).orEmpty()
         }
         if (uris.isEmpty()) return
 
-        resultsContainer.removeAllViews()
-        progressText.text = "Queued ${uris.size} image(s)."
-        inspectNext(uris, index = 0, successes = 0)
+        selectedUris = uris
+        repeatAllButton.isEnabled = true
+        startFreshBatch(uris, clearResults = true)
     }
 
-    private fun inspectNext(uris: List<Uri>, index: Int, successes: Int) {
+    private fun startFreshBatch(uris: List<Uri>, clearResults: Boolean) {
+        if (uris.isEmpty()) return
+        batchSerial += 1
+        activeBatchGeneration += 1
+        val generation = activeBatchGeneration
+        val batchId = batchSerial
+
+        if (clearResults) resultsContainer.removeAllViews()
+        progressText.text = "Fresh batch $batchId queued: ${uris.size} image(s). No prior inspection data will be reused."
+        inspectNext(
+            uris = uris,
+            index = 0,
+            successes = 0,
+            generation = generation,
+            batchId = batchId
+        )
+    }
+
+    private fun inspectNext(
+        uris: List<Uri>,
+        index: Int,
+        successes: Int,
+        generation: Long,
+        batchId: Long
+    ) {
+        if (generation != activeBatchGeneration || isFinishing || isDestroyed) return
         if (index >= uris.size) {
             runOnUiThread {
-                progressText.text = "Inspection finished: $successes/${uris.size} image(s) analyzed."
+                if (generation == activeBatchGeneration) {
+                    progressText.text = "Fresh batch $batchId finished: $successes/${uris.size} image(s) analyzed."
+                }
             }
             return
         }
 
         val uri = uris[index]
         runOnUiThread {
-            progressText.text = "Inspecting ${index + 1}/${uris.size}…"
+            if (generation == activeBatchGeneration) {
+                progressText.text = "Fresh batch $batchId: inspecting ${index + 1}/${uris.size}…"
+            }
         }
 
         analysisExecutor.execute {
+            if (generation != activeBatchGeneration) return@execute
+
             val decoded = runCatching { decodeImage(uri) }
             decoded.onFailure { error ->
                 runOnUiThread {
-                    addErrorCard(displayName(uri), error)
+                    if (generation == activeBatchGeneration) addErrorCard(displayName(uri), error)
                 }
-                inspectNext(uris, index + 1, successes)
+                inspectNext(uris, index + 1, successes, generation, batchId)
                 return@execute
             }
 
@@ -122,12 +164,18 @@ class ResultInspectionActivity : Activity() {
             val fingerprint = VisualFingerprint.from(bitmap)
             val preview = makePreview(bitmap)
 
+            // Deliberately reload the DB and recreate every interpretation component for this pass.
+            val indexSnapshot = runCatching { ArcaeaDatabaseStore(this).load() }.getOrNull()
+            val detector = ArcaeaResultDetector()
+            val parser = ArcaeaResultParser(detector)
+            val freshOcr = MlKitOcrEngine()
+            activeOcrEngines += freshOcr
+
             val started = runCatching {
-                ocrEngine.recognizeNative(bitmap, analysisExecutor) { ocrResult ->
+                freshOcr.recognizeNative(bitmap, analysisExecutor) { ocrResult ->
                     val inspection = ocrResult.map { lines ->
                         val detection = detector.detect(lines, fingerprint, VisionStage.NATIVE)
                         val parsed = parser.parse(lines)
-                        val indexSnapshot = chartIndex
                         val resolution = parsed.title?.let { title ->
                             indexSnapshot?.resolveResultTitle(
                                 rawTitle = title,
@@ -136,10 +184,19 @@ class ResultInspectionActivity : Activity() {
                             )
                         }
                         val resolvedChart = resolution?.chart
+                        val judgements = ArcaeaJudgementReconciler.reconcile(
+                            lines = lines,
+                            initialPure = parsed.pure,
+                            initialFar = parsed.far,
+                            initialLost = parsed.lost,
+                            noteCount = resolvedChart?.notes
+                        )
                         val regions = (detection.regions + parsed.regions)
                             .distinctBy { regionKey(it) }
 
                         Inspection(
+                            sourceUri = uri,
+                            batchId = batchId,
                             name = name,
                             width = width,
                             height = height,
@@ -153,14 +210,16 @@ class ResultInspectionActivity : Activity() {
                             artist = parsed.artist,
                             trackState = parsed.trackState,
                             score = parsed.score,
-                            pure = parsed.pure,
-                            far = parsed.far,
-                            lost = parsed.lost,
+                            pure = judgements.pure,
+                            far = judgements.far,
+                            lost = judgements.lost,
+                            judgementBasis = judgements.basisDescription(),
+                            judgementChecksum = judgements.checksumDescription(),
                             displayedDifficulty = parsed.displayedDifficulty,
                             displayedDifficultyLabel = parsed.displayedDifficultyLabel,
                             displayedLevel = parsed.displayedLevel,
                             chartHiddenOnScreen = parsed.chartHiddenOnScreen,
-                            confidence = parsed.confidence,
+                            confidence = judgements.adjustConfidence(parsed.confidence),
                             databaseSchema = indexSnapshot?.let {
                                 "${it.databaseFormat}/v${it.schemaVersion}"
                             },
@@ -168,6 +227,7 @@ class ResultInspectionActivity : Activity() {
                             resolutionBasis = resolution?.matchKind,
                             resolvedDifficulty = resolvedChart?.difficulty,
                             resolvedLevel = resolvedChart?.level,
+                            resolvedNotes = resolvedChart?.notes,
                             resolvedClassification = resolvedChart?.classificationDescription(),
                             databaseVisibility = when {
                                 resolvedChart != null -> resolvedChart.visibilityDescription()
@@ -179,22 +239,39 @@ class ResultInspectionActivity : Activity() {
                         )
                     }
 
+                    activeOcrEngines.remove(freshOcr)
+                    runCatching { freshOcr.close() }
+
                     runOnUiThread {
+                        if (generation != activeBatchGeneration) {
+                            preview.recycle()
+                            return@runOnUiThread
+                        }
                         inspection.onSuccess(::addInspectionCard)
                             .onFailure { error ->
                                 preview.recycle()
                                 addErrorCard(name, error)
                             }
                     }
-                    inspectNext(uris, index + 1, successes + if (inspection.isSuccess) 1 else 0)
+                    inspectNext(
+                        uris,
+                        index + 1,
+                        successes + if (inspection.isSuccess) 1 else 0,
+                        generation,
+                        batchId
+                    )
                 }
             }
 
             bitmap.recycle()
             started.onFailure { error ->
+                activeOcrEngines.remove(freshOcr)
+                runCatching { freshOcr.close() }
                 preview.recycle()
-                runOnUiThread { addErrorCard(name, error) }
-                inspectNext(uris, index + 1, successes)
+                runOnUiThread {
+                    if (generation == activeBatchGeneration) addErrorCard(name, error)
+                }
+                inspectNext(uris, index + 1, successes, generation, batchId)
             }
         }
     }
@@ -242,7 +319,7 @@ class ResultInspectionActivity : Activity() {
         }
 
         card.addView(TextView(this).apply {
-            text = value.name
+            text = "${value.name}  [fresh batch ${value.batchId}]"
             setTextColor(Color.WHITE)
             textSize = 17f
             setTypeface(typeface, android.graphics.Typeface.BOLD)
@@ -267,6 +344,16 @@ class ResultInspectionActivity : Activity() {
             setTextIsSelectable(true)
             setPadding(0, dp(10), 0, 0)
         })
+
+        card.addView(Button(this).apply {
+            text = "Inspect this image again (fresh)"
+            setOnClickListener {
+                startFreshBatch(listOf(value.sourceUri), clearResults = false)
+            }
+        }, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(8) })
 
         resultsContainer.addView(
             card,
@@ -295,6 +382,7 @@ class ResultInspectionActivity : Activity() {
 
     private fun inspectionText(value: Inspection): String = buildString {
         appendLine("image             : ${value.width}x${value.height}")
+        appendLine("inspection mode   : FRESH (no previous OCR/parse state reused)")
         appendLine("result detected   : ${value.detected}")
         appendLine("strong evidence   : ${value.strong}")
         appendLine("detector strength : ${"%.2f".format(value.strength)}")
@@ -304,6 +392,8 @@ class ResultInspectionActivity : Activity() {
         appendLine("track state       : ${value.trackState ?: "-"}")
         appendLine("score             : ${value.score?.let(::formatScore) ?: "-"}")
         appendLine("PURE / FAR / LOST : ${value.pure ?: "-"} / ${value.far ?: "-"} / ${value.lost ?: "-"}")
+        appendLine("judgement basis   : ${value.judgementBasis}")
+        appendLine("judgement checksum: ${value.judgementChecksum}")
         appendLine("displayed chart   : ${displayedChartText(value)}")
         appendLine("screen chart state: ${ArcaeaChartMarker.visibilityLabel(value.chartHiddenOnScreen)}")
         appendLine("parse confidence  : ${"%.2f".format(value.confidence)}")
@@ -311,6 +401,7 @@ class ResultInspectionActivity : Activity() {
         appendLine("database match    : ${value.songId ?: "-"}")
         appendLine("resolution basis  : ${value.resolutionBasis ?: "-"}")
         appendLine("resolved chart    : ${resolvedChartText(value)}")
+        appendLine("database notes    : ${value.resolvedNotes ?: "-"}")
         appendLine("chart class       : ${value.resolvedClassification ?: "-"}")
         appendLine("database visibility: ${value.databaseVisibility}")
         appendLine()
@@ -355,6 +446,8 @@ class ResultInspectionActivity : Activity() {
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
     private data class Inspection(
+        val sourceUri: Uri,
+        val batchId: Long,
         val name: String,
         val width: Int,
         val height: Int,
@@ -371,6 +464,8 @@ class ResultInspectionActivity : Activity() {
         val pure: Int?,
         val far: Int?,
         val lost: Int?,
+        val judgementBasis: String,
+        val judgementChecksum: String,
         val displayedDifficulty: String?,
         val displayedDifficultyLabel: String?,
         val displayedLevel: String?,
@@ -381,6 +476,7 @@ class ResultInspectionActivity : Activity() {
         val resolutionBasis: String?,
         val resolvedDifficulty: String?,
         val resolvedLevel: String?,
+        val resolvedNotes: Int?,
         val resolvedClassification: String?,
         val databaseVisibility: String,
         val rawOcr: String
