@@ -30,6 +30,7 @@ import com.example.rhythmtracker.game.arcaea.ArcaeaChartIndex
 import com.example.rhythmtracker.game.arcaea.ArcaeaDatabaseStore
 import com.example.rhythmtracker.identity.ResultIdentity
 import com.example.rhythmtracker.identity.VisualFingerprint
+import com.example.rhythmtracker.parser.ArcaeaJudgementReconciler
 import com.example.rhythmtracker.parser.ArcaeaResultParser
 import com.example.rhythmtracker.state.ResultStateMachine
 import com.example.rhythmtracker.vision.MlKitOcrEngine
@@ -357,8 +358,24 @@ class CaptureService : Service() {
             return
         }
 
-        val parsed = parser.parse(result.getOrThrow())
-        val resolution = parsed.title?.let { chartIndex?.resolveTitle(it) }
+        val lines = result.getOrThrow()
+        val parsed = parser.parse(lines)
+        val resolution = parsed.title?.let { title ->
+            chartIndex?.resolveResultTitle(
+                rawTitle = title,
+                displayedDifficulty = parsed.displayedDifficulty,
+                hiddenOnScreen = parsed.chartHiddenOnScreen
+            )
+        }
+        val judgements = ArcaeaJudgementReconciler.reconcile(
+            lines = lines,
+            initialPure = parsed.pure,
+            initialFar = parsed.far,
+            initialLost = parsed.lost,
+            noteCount = resolution?.chart?.notes
+        )
+        val confidence = judgements.adjustConfidence(parsed.confidence)
+
         val playResult = PlayResult(
             id = UUID.randomUUID().toString(),
             capturedAtMs = capturedAtMs,
@@ -369,10 +386,10 @@ class CaptureService : Service() {
             artist = parsed.artist,
             trackState = parsed.trackState,
             score = parsed.score ?: identity?.score,
-            pure = parsed.pure,
-            far = parsed.far,
-            lost = parsed.lost,
-            confidence = parsed.confidence,
+            pure = judgements.pure,
+            far = judgements.far,
+            lost = judgements.lost,
+            confidence = confidence,
             screenshotPath = screenshotPath,
             rawOcr = parsed.rawText,
             source = "media-projection-v2"
@@ -392,16 +409,18 @@ class CaptureService : Service() {
             append(parsed.trackState ?: "?")
             append(" | ")
             append(parsed.score ?: identity?.score ?: "?")
-            if (parsed.pure != null || parsed.far != null || parsed.lost != null) {
+            if (judgements.pure != null || judgements.far != null || judgements.lost != null) {
                 append(" | P/F/L ")
-                append(parsed.pure ?: "?")
+                append(judgements.pure ?: "?")
                 append('/')
-                append(parsed.far ?: "?")
+                append(judgements.far ?: "?")
                 append('/')
-                append(parsed.lost ?: "?")
+                append(judgements.lost ?: "?")
+                append(" | notes ")
+                append(judgements.checksumDescription())
             }
         }
-        TrackerRuntime.lastMessage = "Parsed distinct result; confidence=${"%.2f".format(parsed.confidence)}"
+        TrackerRuntime.lastMessage = "Parsed distinct result; confidence=${"%.2f".format(confidence)}"
 
         // A slow old native pass is allowed to persist its result, but not overwrite the visual
         // debugger after a newer result has already been accepted.
@@ -421,7 +440,9 @@ class CaptureService : Service() {
                 .put("generation", generation)
                 .put("title", parsed.title)
                 .put("score", parsed.score)
-                .put("confidence", parsed.confidence.toDouble())
+                .put("confidence", confidence.toDouble())
+                .put("note_count", resolution?.chart?.notes)
+                .put("judgement_checksum", judgements.checksumDescription())
         )
     }
 

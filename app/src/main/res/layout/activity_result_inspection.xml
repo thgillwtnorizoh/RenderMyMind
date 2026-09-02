@@ -23,7 +23,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="6dp"
-            android:text="Import one or many screenshots. They are analyzed with the same native-resolution multilingual OCR and parser used by live tracking. Imported images are inspection-only and are not added to play history."
+            android:text="Import one or many screenshots. Every inspection pass decodes the original image again and creates fresh OCR, detector and parser instances. Previous inspection output is never reused. Imported images are inspection-only and are not added to play history."
             android:textColor="#B8BBC2"
             android:textSize="14sp" />
 
@@ -33,6 +33,13 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="16dp"
             android:text="Choose result images" />
+
+        <Button
+            android:id="@+id/repeatInspectionImagesButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Re-inspect selected images (fresh)" />
 
         <TextView
             android:id="@+id/inspectionProgressText"
